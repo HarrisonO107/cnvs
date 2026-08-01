@@ -18,7 +18,7 @@ struct CardSurface: ViewModifier {
     // panes, only a whisper of darkening for text legibility.
     func body(content: Content) -> some View {
         content
-            .background(Color.black.opacity(0.18))
+            .background(Color.black.opacity(0.10))
             .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
@@ -30,7 +30,7 @@ struct CardSurface: ViewModifier {
                         lineWidth: 1
                     )
             )
-            .shadow(color: .black.opacity(0.45), radius: 24, y: 10)
+            .shadow(color: .black.opacity(0.32), radius: 24, y: 10)
     }
 }
 

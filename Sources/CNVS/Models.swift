@@ -13,11 +13,14 @@ struct Card: Identifiable, Codable {
     var width: CGFloat
     var height: CGFloat
     var z: Double
+    /// Backing tmux session for terminal cards (creatoros-<digits>), persisted
+    /// so a relaunch reattaches the same shells and the phone list stays true.
+    var session: String?
 
     var bootCommand: String? // not persisted
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, title, x, y, width, height, z
+        case id, kind, title, x, y, width, height, z, session
     }
 }
 
@@ -27,9 +30,10 @@ final class WorkspaceStore: ObservableObject {
         didSet { scheduleSave() }
     }
 
-    static let gridStep: CGFloat = 40
     static let margin: CGFloat = 12
     static let gutter: CGFloat = 12
+    /// Tiles stop short of the floating command bar at the bottom.
+    static let commandBarClearance: CGFloat = 56
 
     /// Kept current by RootView; placement needs it to know where cards fit.
     var canvasSize = CGSize(width: 1380, height: 800)
@@ -39,8 +43,20 @@ final class WorkspaceStore: ObservableObject {
 
     init() {
         if let data = UserDefaults.standard.data(forKey: saveKey),
-           let saved = try? JSONDecoder().decode([Card].self, from: data),
+           var saved = try? JSONDecoder().decode([Card].self, from: data),
            !saved.isEmpty {
+            // Terminals saved before sessions existed get one now, so every
+            // pane is tmux-backed and phone-visible after this launch.
+            for i in saved.indices where saved[i].kind == .terminal && saved[i].session == nil {
+                saved[i].session = Self.newSessionName()
+            }
+            // The queued-URL-flush bug could persist several cards for one
+            // session; keep the first of each.
+            var seen = Set<String>()
+            saved.removeAll { card in
+                guard let s = card.session else { return false }
+                return !seen.insert(s).inserted
+            }
             cards = saved
         } else {
             cards = Self.defaultLayout()
@@ -49,10 +65,17 @@ final class WorkspaceStore: ObservableObject {
 
     static func defaultLayout() -> [Card] {
         [
-            Card(id: UUID(), kind: .terminal, title: "terminal", x: 40, y: 40, width: 760, height: 620, z: 1),
+            Card(id: UUID(), kind: .terminal, title: "terminal", x: 40, y: 40, width: 760, height: 620, z: 1, session: newSessionName()),
             Card(id: UUID(), kind: .player, title: "player", x: 830, y: 40, width: 460, height: 430, z: 2),
             Card(id: UUID(), kind: .notes, title: "notes", x: 830, y: 490, width: 460, height: 270, z: 3),
         ]
+    }
+
+    /// Same shape the build listener generates — the phone's list and kill
+    /// endpoint both require creatoros-<digits> exactly.
+    static func newSessionName() -> String {
+        let ms = UInt64(Date().timeIntervalSince1970 * 1000)
+        return "creatoros-\(ms)\(Int.random(in: 100...999))"
     }
 
     func raise(_ id: UUID) {
@@ -68,18 +91,21 @@ final class WorkspaceStore: ObservableObject {
         cards.removeAll { $0.id == id }
     }
 
-    func addTerminal(bootCommand: String? = nil, title: String? = nil) {
+    func addTerminal(bootCommand: String? = nil, title: String? = nil, session: String? = nil) {
         let n = cards.filter { $0.kind == .terminal }.count + 1
         let top = (cards.map(\.z).max() ?? 0) + 1
-        let size = CGSize(width: 680, height: 480)
-        let origin = spawnOrigin(for: size)
         var card = Card(
             id: UUID(), kind: .terminal, title: title ?? "terminal \(n)",
-            x: origin.x, y: origin.y,
-            width: size.width, height: size.height, z: top
+            x: Self.margin, y: Self.margin, width: 680, height: 480, z: top,
+            session: session ?? Self.newSessionName()
         )
         card.bootCommand = bootCommand
         cards.append(card)
+        // Start the shell NOW, not at first render — with the window occluded
+        // (phone-triggered opens), SwiftUI defers makeNSView indefinitely and
+        // the tmux session would never attach.
+        _ = TerminalRegistry.shared.view(for: card.id, session: card.session, bootCommand: card.bootCommand)
+        tidy()
     }
 
     func togglePanel(_ kind: CardKind) {
@@ -87,81 +113,83 @@ final class WorkspaceStore: ObservableObject {
             close(existing.id)
         } else {
             let top = (cards.map(\.z).max() ?? 0) + 1
-            let size = CGSize(width: 460, height: 300)
-            let origin = spawnOrigin(for: size)
-            let card = Card(
+            cards.append(Card(
                 id: UUID(), kind: kind, title: kind == .player ? "player" : "notes",
-                x: origin.x, y: origin.y, width: size.width, height: size.height, z: top
-            )
-            cards.append(card)
+                x: Self.margin, y: Self.margin, width: 460, height: 300, z: top
+            ))
         }
+        tidy()
     }
 
-    // MARK: - Grid layout
+    // MARK: - Layout
 
-    /// New cards land on the first free grid slot (rows, left→right) so nothing
-    /// spawns overlapping. Manual drags are never snapped — only spawn and
-    /// tidy() touch the grid.
-    private func spawnOrigin(for size: CGSize) -> CGPoint {
-        let taken = cards.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
-        if let slot = freeSlots(for: size, avoiding: taken).first {
-            return slot
-        }
-        // Canvas full — cascade so the card is at least visible and grabbable.
-        let n = cards.count
-        return CGPoint(
-            x: Self.margin + CGFloat(n % 8) * Self.gridStep,
-            y: Self.margin + CGFloat(n % 8) * Self.gridStep
-        )
-    }
-
-    /// Snap every card to its nearest free grid slot. Sweeps top-left first so
-    /// the result reads as rows; collisions push a card to the next-nearest slot.
+    /// Deliberate layout, not nearest-slot snapping: player and notes dock as a
+    /// column on the far right; every terminal gets the SAME size, tiled
+    /// side-by-side (wrapping to rows only when columns would get too narrow)
+    /// in the remaining space. Runs on every spawn/toggle and on ⌘G — manual
+    /// drags stay wherever they were dropped until then.
     func tidy() {
-        let step = Self.gridStep
-        var placed: [CGRect] = []
-        let order = cards.indices.sorted {
-            (cards[$0].y, cards[$0].x) < (cards[$1].y, cards[$1].x)
-        }
-        for i in order {
-            var c = cards[i]
-            c.width = min(max(280, round(c.width / step) * step), canvasSize.width - 2 * Self.margin)
-            c.height = min(max(180, round(c.height / step) * step), canvasSize.height - 2 * Self.margin)
-            let size = CGSize(width: c.width, height: c.height)
-            let target = CGPoint(
-                x: Self.margin + round((c.x - Self.margin) / step) * step,
-                y: Self.margin + round((c.y - Self.margin) / step) * step
-            )
-            let slots = freeSlots(for: size, avoiding: placed)
-            let origin = slots.min(by: {
-                hypot($0.x - target.x, $0.y - target.y) < hypot($1.x - target.x, $1.y - target.y)
-            }) ?? target
-            c.x = origin.x
-            c.y = origin.y
-            placed.append(CGRect(x: c.x, y: c.y, width: c.width, height: c.height))
-            cards[i] = c
-        }
-    }
+        let g = Self.gutter
+        var free = CGRect(
+            x: Self.margin, y: Self.margin,
+            width: canvasSize.width - 2 * Self.margin,
+            height: canvasSize.height - 2 * Self.margin - Self.commandBarClearance
+        )
 
-    /// Every grid origin where a card of `size` fits inside the canvas without
-    /// touching `avoiding` (plus a gutter), in row-major order.
-    private func freeSlots(for size: CGSize, avoiding: [CGRect]) -> [CGPoint] {
-        let step = Self.gridStep
-        var slots: [CGPoint] = []
-        var y = Self.margin
-        while y + size.height <= canvasSize.height - Self.margin {
-            var x = Self.margin
-            while x + size.width <= canvasSize.width - Self.margin {
-                let candidate = CGRect(x: x, y: y, width: size.width, height: size.height)
-                    .insetBy(dx: -Self.gutter, dy: -Self.gutter)
-                if !avoiding.contains(where: { $0.intersects(candidate) }) {
-                    slots.append(CGPoint(x: x, y: y))
-                }
-                x += step
+        let side = cards.indices
+            .filter { cards[$0].kind != .terminal }
+            .sorted { cards[$0].kind == .player && cards[$1].kind != .player }
+        if !side.isEmpty {
+            let panelW = min(460, free.width * 0.38)
+            let count = CGFloat(side.count)
+            let panelH = (free.height - g * (count - 1)) / count
+            var y = free.minY
+            for i in side {
+                cards[i].x = free.maxX - panelW
+                cards[i].y = y
+                cards[i].width = panelW
+                cards[i].height = panelH
+                y += panelH + g
             }
-            y += step
+            free.size.width -= panelW + g
         }
-        return slots
+
+        let terms = cards.indices
+            .filter { cards[$0].kind == .terminal }
+            .sorted { (cards[$0].y, cards[$0].x) < (cards[$1].y, cards[$1].x) }
+        guard !terms.isEmpty else { return }
+
+        let n = terms.count
+        var cols = n
+        while cols > 1 && (free.width - g * CGFloat(cols - 1)) / CGFloat(cols) < 380 {
+            cols -= 1
+        }
+        var rows = Int(ceil(Double(n) / Double(cols)))
+        while rows > 1 && cols < n
+            && (free.height - g * CGFloat(rows - 1)) / CGFloat(rows) < 240 {
+            cols += 1
+            rows = Int(ceil(Double(n) / Double(cols)))
+        }
+
+        // Balanced rows, each spanning the full region width — an uneven count
+        // stretches the shorter rows (7 → 2+2+3, widest on top) so no patch of
+        // canvas sits empty.
+        let base = n / rows
+        let extra = n % rows
+        let rowCounts = (0..<rows).map { $0 >= rows - extra ? base + 1 : base }
+        let cellH = (free.height - g * CGFloat(rows - 1)) / CGFloat(rows)
+        var k = 0
+        for (r, count) in rowCounts.enumerated() {
+            let cellW = (free.width - g * CGFloat(count - 1)) / CGFloat(count)
+            for c in 0..<count {
+                let i = terms[k]
+                k += 1
+                cards[i].x = free.minX + CGFloat(c) * (cellW + g)
+                cards[i].y = free.minY + CGFloat(r) * (cellH + g)
+                cards[i].width = cellW
+                cards[i].height = cellH
+            }
+        }
     }
 
     private func scheduleSave() {
