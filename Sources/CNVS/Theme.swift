@@ -14,10 +14,11 @@ enum Theme {
 }
 
 struct CardSurface: ViewModifier {
+    // No system material: literal clear glass — wallpaper stays crisp behind
+    // panes, only a whisper of darkening for text legibility.
     func body(content: Content) -> some View {
         content
-            .background(.ultraThinMaterial)
-            .background(Theme.cardBackground)
+            .background(Color.black.opacity(0.18))
             .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)

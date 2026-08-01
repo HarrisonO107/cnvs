@@ -13,7 +13,11 @@ final class TerminalRegistry {
 
         let tv = LocalProcessTerminalView(frame: .init(x: 0, y: 0, width: 600, height: 400))
         tv.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-        tv.nativeBackgroundColor = .clear
+        // Alpha 0 keeps every SwiftTerm background fill a no-op (true glass),
+        // while the RGB components give shells querying the terminal colour
+        // (OSC 11 — Claude Code theme detection) a sane dark navy instead of
+        // whatever NSColor.clear converts to.
+        tv.nativeBackgroundColor = NSColor(srgbRed: 0.03, green: 0.045, blue: 0.09, alpha: 0.0)
         tv.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
 
         var env = ProcessInfo.processInfo.environment
@@ -57,5 +61,9 @@ struct TerminalPane: NSViewRepresentable {
         TerminalRegistry.shared.view(for: cardID, bootCommand: bootCommand)
     }
 
-    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {}
+    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
+        // SwiftTerm re-syncs its layer background from internal setup paths;
+        // keep forcing it clear so the pane never goes opaque again.
+        nsView.layer?.backgroundColor = NSColor.clear.cgColor
+    }
 }
