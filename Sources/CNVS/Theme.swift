@@ -14,26 +14,37 @@ enum Theme {
 }
 
 struct CardSurface: ViewModifier {
+    /// `clear` drops the pane entirely — used by the radio card, where the
+    /// video's own edges are the only frame worth drawing.
+    var clear = false
+
     // No system material: literal clear glass — wallpaper stays crisp behind
     // panes, only a whisper of darkening for text legibility.
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content
-            .background(Color.black.opacity(0.10))
-            .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [.white.opacity(0.22), .white.opacity(0.05)],
-                            startPoint: .top, endPoint: .bottom
-                        ),
-                        lineWidth: 1
-                    )
-            )
-            .shadow(color: .black.opacity(0.32), radius: 24, y: 10)
+        if clear {
+            content
+        } else {
+            content
+                .background(Color.black.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [.white.opacity(0.22), .white.opacity(0.05)],
+                                startPoint: .top, endPoint: .bottom
+                            ),
+                            lineWidth: 1
+                        )
+                )
+                .shadow(color: .black.opacity(0.32), radius: 24, y: 10)
+        }
     }
 }
 
 extension View {
-    func cardSurface() -> some View { modifier(CardSurface()) }
+    func cardSurface(clear: Bool = false) -> some View {
+        modifier(CardSurface(clear: clear))
+    }
 }

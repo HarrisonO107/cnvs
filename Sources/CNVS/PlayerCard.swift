@@ -159,6 +159,9 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     }
 
     func toggle() { webView.evaluateJavaScript("toggle()") }
+    /// Used when the card switches to Claude FM — two audio sources must never
+    /// play over each other.
+    func pause() { webView.evaluateJavaScript("pauseIt()") }
     func next() { webView.evaluateJavaScript("next()") }
     func prev() { webView.evaluateJavaScript("prev()") }
     func skip(to index: Int) { webView.evaluateJavaScript("skipTo(\(index))") }
@@ -253,18 +256,13 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     }
     function index(){ widget.getCurrentSoundIndex(ix => post({t:'index', ix:ix})); }
     function toggle(){ if (widget) widget.toggle(); }
+    function pauseIt(){ if (widget) widget.pause(); }
     function next(){ if (widget) widget.next(); }
     function prev(){ if (widget) widget.prev(); }
     function skipTo(i){ if (widget) widget.skip(i); }
     function seekRel(f){ if (widget) widget.getDuration(d => widget.seekTo(d*f)); }
     </script></body></html>
     """
-}
-
-struct WebViewHost: NSViewRepresentable {
-    let webView: WKWebView
-    func makeNSView(context: Context) -> WKWebView { webView }
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
 }
 
 struct PlayerCardView: View {

@@ -72,6 +72,78 @@ final class NotesStore: ObservableObject {
         if let note = notes.first(where: { $0.id == url }) { select(note) }
     }
 
+    func rename(_ note: Note, to raw: String) {
+        flushSave()
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        while cleaned.hasPrefix(".") { cleaned.removeFirst() }
+        guard !cleaned.isEmpty, cleaned != note.name else { return }
+
+        var url = dir.appendingPathComponent(cleaned).appendingPathExtension("md")
+        var i = 2
+        while url.path.lowercased() != note.id.path.lowercased(),
+              FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(cleaned)-\(i)").appendingPathExtension("md")
+            i += 1
+        }
+
+        let wasSelected = selected?.id == note.id
+        do {
+            try FileManager.default.moveItem(at: note.id, to: url)
+        } catch { return }
+        refresh()
+        if wasSelected {
+            selected = notes.first(where: { $0.id == url })
+        }
+    }
+
+    func delete(_ note: Note) {
+        if selected?.id == note.id {
+            saveWork?.cancel()
+            selected = nil
+            text = ""
+        }
+        try? FileManager.default.trashItem(at: note.id, resultingItemURL: nil)
+        refresh()
+    }
+
+    /// Voice capture: append to a named note (fuzzy match), or create a fresh
+    /// titled + dated note per capture. Same title same day appends — a new
+    /// topic always gets its own file. Returns the HUD line.
+    func append(_ raw: String, title: String?, toNoteNamed target: String?) -> String {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return "nothing to note" }
+
+        let stamp = ISO8601DateFormatter().string(from: Date()).prefix(10)
+        let url: URL
+        if let target,
+           let match = notes.first(where: { $0.name.lowercased().contains(target.lowercased()) }) {
+            url = match.id
+        } else {
+            var clean = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+            if clean.isEmpty {
+                clean = line.split(separator: " ").prefix(4).joined(separator: " ")
+            }
+            url = dir.appendingPathComponent("\(clean) \(stamp).md")
+            if !FileManager.default.fileExists(atPath: url.path) {
+                let time = Date().formatted(date: .omitted, time: .shortened)
+                try? "# \(clean)\n\(stamp) \(time)\n\n".write(to: url, atomically: true, encoding: .utf8)
+            }
+        }
+
+        if selected?.id == url { flushSave() }
+        var content = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        if !content.isEmpty && !content.hasSuffix("\n") { content += "\n" }
+        content += "- \(line)\n"
+        try? content.write(to: url, atomically: true, encoding: .utf8)
+        if selected?.id == url { text = content }
+        refresh()
+        return "noted → \(url.deletingPathExtension().lastPathComponent)"
+    }
+
     func textChanged() {
         saveWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.flushSave() }
@@ -133,6 +205,11 @@ extension String {
 struct NotesCardView: View {
     @ObservedObject var store: NotesStore
     @State private var editMode = true
+    @State private var titleDraft = ""
+    @State private var renamingID: URL?
+    @State private var renameText = ""
+    @FocusState private var renameFocused: Bool
+    @FocusState private var titleFocused: Bool
 
     var body: some View {
         HStack(spacing: 0) {
@@ -144,6 +221,8 @@ struct NotesCardView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Theme.headerText)
+                    .keyboardShortcut("n", modifiers: .command)
+                    .help("new note (⌘N)")
                     Spacer()
                     Button(action: { store.organize() }) {
                         HStack(spacing: 3) {
@@ -166,24 +245,7 @@ struct NotesCardView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(store.notes) { note in
-                            Button(action: { store.select(note) }) {
-                                Text(note.name)
-                                    .font(Theme.mono(11))
-                                    .lineLimit(1)
-                                    .foregroundStyle(
-                                        store.selected?.id == note.id
-                                            ? .white.opacity(0.95) : Theme.headerText
-                                    )
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(
-                                        store.selected?.id == note.id
-                                            ? Color.white.opacity(0.08) : .clear
-                                    )
-                                    .clipShape(RoundedRectangle(cornerRadius: 5))
-                            }
-                            .buttonStyle(.plain)
+                            noteRow(note)
                         }
                     }
                     .padding(.horizontal, 4)
@@ -194,7 +256,19 @@ struct NotesCardView: View {
             Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
 
             VStack(spacing: 0) {
-                HStack {
+                HStack(spacing: 8) {
+                    if let sel = store.selected {
+                        TextField("untitled", text: $titleDraft)
+                            .textFieldStyle(.plain)
+                            .font(Theme.mono(12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .focused($titleFocused)
+                            .onSubmit {
+                                store.rename(sel, to: titleDraft)
+                                titleFocused = false
+                            }
+                            .help("click to rename")
+                    }
                     if let status = store.organizeStatus {
                         Text(status)
                             .font(Theme.mono(9))
@@ -221,6 +295,7 @@ struct NotesCardView: View {
                 } else if editMode {
                     TextEditor(text: $store.text)
                         .font(Theme.mono(12))
+                        .lineSpacing(3)
                         .scrollContentBackground(.hidden)
                         .foregroundStyle(.white.opacity(0.88))
                         .padding(.horizontal, 6)
@@ -229,13 +304,89 @@ struct NotesCardView: View {
                     ScrollView {
                         Text(renderedMarkdown)
                             .font(Theme.mono(12))
+                            .lineSpacing(3)
                             .foregroundStyle(.white.opacity(0.88))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(10)
                             .textSelection(.enabled)
                     }
                 }
+
+                if let sel = store.selected {
+                    HStack {
+                        Text("\(wordCount)w · \(store.text.count)c")
+                        Spacer()
+                        Text(sel.modified, format: .dateTime.day().month().hour().minute())
+                    }
+                    .font(Theme.mono(9))
+                    .foregroundStyle(Theme.headerText.opacity(0.8))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                }
             }
+            .onChange(of: store.selected?.id) {
+                titleDraft = store.selected?.name ?? ""
+            }
+            .onChange(of: titleFocused) {
+                if !titleFocused, let sel = store.selected {
+                    store.rename(sel, to: titleDraft)
+                    titleDraft = store.selected?.name ?? ""
+                }
+            }
+            .onAppear { titleDraft = store.selected?.name ?? "" }
+        }
+    }
+
+    private var wordCount: Int {
+        store.text.split(whereSeparator: { $0.isWhitespace }).count
+    }
+
+    @ViewBuilder
+    private func noteRow(_ note: Note) -> some View {
+        let isSelected = store.selected?.id == note.id
+        if renamingID == note.id {
+            TextField("", text: $renameText)
+                .textFieldStyle(.plain)
+                .font(Theme.mono(11))
+                .foregroundStyle(.white.opacity(0.95))
+                .focused($renameFocused)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .onAppear { renameFocused = true }
+                .onSubmit {
+                    store.rename(note, to: renameText)
+                    renamingID = nil
+                }
+                .onExitCommand { renamingID = nil }
+                .onChange(of: renameFocused) {
+                    if !renameFocused, renamingID == note.id {
+                        store.rename(note, to: renameText)
+                        renamingID = nil
+                    }
+                }
+        } else {
+            Text(note.name)
+                .font(Theme.mono(11))
+                .lineLimit(1)
+                .foregroundStyle(isSelected ? .white.opacity(0.95) : Theme.headerText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(isSelected ? Color.white.opacity(0.08) : .clear)
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { store.delete(note) }
+                .simultaneousGesture(TapGesture().onEnded { store.select(note) })
+                .contextMenu {
+                    Button("rename") {
+                        renameText = note.name
+                        renamingID = note.id
+                    }
+                    Button("delete", role: .destructive) { store.delete(note) }
+                }
+                .help("double-click to delete · right-click to rename")
         }
     }
 

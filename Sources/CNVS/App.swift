@@ -25,12 +25,26 @@ struct CNVSApp: App {
                     NotificationCenter.default.post(name: .cnvsTidy, object: nil)
                 }
                 .keyboardShortcut("g", modifiers: [.command])
+                Button("Voice") {
+                    NotificationCenter.default.post(name: .cnvsVoiceToggle, object: nil)
+                }
+                .keyboardShortcut(.space, modifiers: [.option])
+                Button("Wake Word") {
+                    NotificationCenter.default.post(name: .cnvsWakeToggle, object: nil)
+                }
+                .keyboardShortcut(.space, modifiers: [.option, .shift])
+                Button("Simulator") {
+                    NotificationCenter.default.post(name: .cnvsSimulatorToggle, object: nil)
+                }
+                .keyboardShortcut("i", modifiers: [.command])
             }
         }
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var activity: NSObjectProtocol?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -39,6 +53,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.isMovableByWindowBackground = false
             window.styleMask.insert(.fullSizeContentView)
             window.backgroundColor = .black
+        }
+        // No App Nap: phone terminal requests must be handled while CNVS sits
+        // in the background.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "phone terminal requests"
+        )
+        MainActor.assumeIsolated {
+            PhoneTerminalRequests.shared.startWatching()
         }
     }
 
@@ -52,14 +75,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
-/// `cnvs://terminal?session=creatoros-<digits>` — sent by the Mac build listener
-/// when the phone asks for a terminal. Requests are queued rather than handled
-/// inline because on a cold launch the URL arrives before RootView has mounted
-/// its listeners; RootView drains the queue on appear and on each notification.
+/// Terminal requests from the phone, two transports:
+/// 1. Spool files in ~/.creatoros/cnvs-open — the build listener's path. A
+///    kqueue watch fires even while CNVS is backgrounded; kAEGetURL does NOT
+///    (URL events queue until the app activates, then flush as duplicates).
+/// 2. cnvs://terminal?session=… — kept for manual/scripted opens.
+/// Requests queue rather than run inline because on a cold launch they arrive
+/// before RootView has mounted its listeners; RootView drains on appear and on
+/// each notification, skipping sessions that already have a card.
 @MainActor
 final class PhoneTerminalRequests {
     static let shared = PhoneTerminalRequests()
     private var pending: [String] = []
+    private var spoolSource: DispatchSourceFileSystemObject?
+    private let spoolDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".creatoros/cnvs-open")
+
+    func startWatching() {
+        try? FileManager.default.createDirectory(at: spoolDir, withIntermediateDirectories: true)
+        drainSpool()
+        let fd = Darwin.open(spoolDir.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: .write, queue: .main
+        )
+        src.setEventHandler { [weak self] in self?.drainSpool() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        spoolSource = src
+    }
+
+    private func drainSpool() {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: spoolDir.path)
+        else { return }
+        for name in names.sorted() where isValidSession(name) {
+            try? FileManager.default.removeItem(at: spoolDir.appendingPathComponent(name))
+            enqueue(name)
+        }
+    }
 
     func accept(_ url: URL) {
         guard url.scheme == "cnvs", url.host == "terminal",
@@ -67,6 +120,11 @@ final class PhoneTerminalRequests {
               let session = items.first(where: { $0.name == "session" })?.value,
               isValidSession(session)
         else { return }
+        enqueue(session)
+    }
+
+    private func enqueue(_ session: String) {
+        guard !pending.contains(session) else { return }
         pending.append(session)
         NotificationCenter.default.post(name: .cnvsOpenPhoneTerminal, object: nil)
     }
@@ -92,4 +150,7 @@ extension Notification.Name {
     static let cnvsFocusCommandBar = Notification.Name("cnvsFocusCommandBar")
     static let cnvsTidy = Notification.Name("cnvsTidy")
     static let cnvsOpenPhoneTerminal = Notification.Name("cnvsOpenPhoneTerminal")
+    static let cnvsVoiceToggle = Notification.Name("cnvsVoiceToggle")
+    static let cnvsWakeToggle = Notification.Name("cnvsWakeToggle")
+    static let cnvsSimulatorToggle = Notification.Name("cnvsSimulatorToggle")
 }

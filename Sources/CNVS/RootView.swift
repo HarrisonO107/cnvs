@@ -2,8 +2,9 @@ import SwiftUI
 
 struct RootView: View {
     @StateObject private var store = WorkspaceStore()
-    @StateObject private var player = PlayerModel()
+    @StateObject private var hub = PlayerHub()
     @StateObject private var notes = NotesStore()
+    @StateObject private var voice = VoiceController()
     @State private var commandText = ""
     @FocusState private var commandFocused: Bool
 
@@ -14,7 +15,7 @@ struct RootView: View {
             GeometryReader { geo in
                 ZStack(alignment: .topLeading) {
                     ForEach($store.cards) { $card in
-                        CardView(card: $card, store: store, player: player, notes: notes)
+                        CardView(card: $card, store: store, hub: hub, notes: notes)
                             .zIndex(card.z)
                     }
                 }
@@ -24,12 +25,16 @@ struct RootView: View {
             }
             .padding(.top, 28) // clear the traffic lights
 
-            commandBar
-                .padding(.bottom, 14)
+            VStack(spacing: 8) {
+                if voice.phase != .idle { voiceHUD }
+                commandBar
+            }
+            .padding(.bottom, 14)
         }
+        .animation(Self.tidySpring, value: voice.phase)
         .ignoresSafeArea()
         .onReceive(NotificationCenter.default.publisher(for: .cnvsNewTerminal)) { _ in
-            store.addTerminal()
+            withAnimation(Self.tidySpring) { store.addTerminal() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .cnvsFocusCommandBar)) { _ in
             commandFocused = true
@@ -40,24 +45,40 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cnvsOpenPhoneTerminal)) { _ in
             openPhoneTerminals()
         }
-        .onAppear { openPhoneTerminals() }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsVoiceToggle)) { _ in
+            voice.toggle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsWakeToggle)) { _ in
+            voice.toggleWake()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsSimulatorToggle)) { _ in
+            withAnimation(Self.tidySpring) { store.togglePanel(.simulator) }
+        }
+        .onAppear {
+            openPhoneTerminals()
+            wireVoice()
+            voice.resumeWakeIfEnabled()
+        }
     }
 
+    static let tidySpring = Animation.spring(response: 0.35, dampingFraction: 0.85)
+
     private func tidy() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+        withAnimation(Self.tidySpring) {
             store.tidy()
         }
     }
 
-    /// Terminals the phone asked for via cnvs://terminal?session=… — each pane
-    /// attaches to (or revives) the listener-created tmux session, so the phone's
-    /// ttyd viewer and this pane are the same shell.
+    /// Terminals the phone asked for via cnvs://terminal?session=… — the pane
+    /// attaches to the listener-created tmux session, so the phone's ttyd
+    /// viewer and this pane are the same shell.
     private func openPhoneTerminals() {
         for session in PhoneTerminalRequests.shared.drain() {
-            store.addTerminal(
-                bootCommand: "exec /opt/homebrew/bin/tmux new-session -A -s \(session)",
-                title: "phone·\(session.suffix(4))"
-            )
+            // Both transports can announce the same session — one card each.
+            guard !store.cards.contains(where: { $0.session == session }) else { continue }
+            withAnimation(Self.tidySpring) {
+                store.addTerminal(title: "phone·\(session.suffix(4))", session: session)
+            }
         }
     }
 
@@ -104,7 +125,9 @@ struct RootView: View {
                 .onSubmit {
                     let prompt = commandText.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !prompt.isEmpty else { return }
-                    store.addTerminal(bootCommand: "claude " + prompt.shellQuoted)
+                    withAnimation(Self.tidySpring) {
+                        store.addTerminal(bootCommand: "claude " + prompt.shellQuoted)
+                    }
                     commandText = ""
                     commandFocused = false
                 }
@@ -114,10 +137,29 @@ struct RootView: View {
 
             Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 16)
 
-            barButton("terminal.fill", help: "new terminal (⌘T)") { store.addTerminal() }
-            barButton("music.note", help: "toggle player") { store.togglePanel(.player) }
-            barButton("note.text", help: "toggle notes") { store.togglePanel(.notes) }
+            barButton("terminal.fill", help: "new terminal (⌘T)") {
+                withAnimation(Self.tidySpring) { store.addTerminal() }
+            }
+            barButton("music.note", help: "toggle player") {
+                withAnimation(Self.tidySpring) { store.togglePanel(.player) }
+            }
+            barButton("note.text", help: "toggle notes") {
+                withAnimation(Self.tidySpring) { store.togglePanel(.notes) }
+            }
+            barButton("iphone", help: "toggle simulator (⌘I)") {
+                withAnimation(Self.tidySpring) { store.togglePanel(.simulator) }
+            }
+            barButton("arrow.triangle.branch", help: "toggle github helper") {
+                withAnimation(Self.tidySpring) { store.togglePanel(.github) }
+            }
+            barButton("chart.bar.fill", help: "toggle claude usage") {
+                withAnimation(Self.tidySpring) { store.togglePanel(.claudeUsage) }
+            }
             barButton("square.grid.3x3", help: "tidy — snap to grid (⌘G)") { tidy() }
+            barButton(voice.phase == .listening ? "mic.fill" : "mic",
+                      help: "voice (⌥Space)") { voice.toggle() }
+            barButton(voice.wakeEnabled ? "ear.fill" : "ear",
+                      help: "wake word — say \"agent\" (⌥⇧Space)") { voice.toggleWake() }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -134,16 +176,272 @@ struct RootView: View {
         .buttonStyle(.plain)
         .help(help)
     }
+
+    // MARK: - Voice
+
+    private var voiceHUD: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                switch voice.phase {
+                case .listening:
+                    Circle()
+                        .fill(Color(red: 0.95, green: 0.35, blue: 0.35))
+                        .frame(width: 7, height: 7)
+                    Text("listening — tap to send")
+                        .foregroundStyle(Theme.headerText)
+                case .routing:
+                    ProgressView().controlSize(.mini)
+                    Text("routing…")
+                        .foregroundStyle(Theme.headerText)
+                case .done(let summary):
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(red: 0.45, green: 0.85, blue: 0.55))
+                    Text(summary)
+                case .failed(let message):
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                    Text(message)
+                case .idle:
+                    EmptyView()
+                }
+                Spacer(minLength: 0)
+                Text("⌥Space")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.headerText)
+            }
+            .font(Theme.mono(11))
+            .foregroundStyle(.white.opacity(0.9))
+
+            // Full live transcript — the box grows with what he's saying.
+            if voice.phase == .listening || voice.phase == .routing,
+               !voice.transcript.isEmpty {
+                Text(voice.transcript)
+                    .font(Theme.mono(11))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // After routing: what it heard, what it thought, what it sent.
+            if case .done = voice.phase {
+                if !voice.transcript.isEmpty {
+                    Text("“\(voice.transcript)”")
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.headerText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let thought = voice.lastIntent?.thought, !thought.isEmpty {
+                    Text(thought)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.accent.opacity(0.85))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let payload = voicePayload {
+                    Text(payload)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(.white.opacity(0.88))
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.white.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            if case .failed = voice.phase, !voice.transcript.isEmpty {
+                Text("“\(voice.transcript)”")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.headerText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(width: 560)
+        .cardSurface()
+        .contentShape(Rectangle())
+        .onTapGesture {
+            switch voice.phase {
+            case .listening: voice.toggle()   // finish early, send now
+            case .done, .failed: voice.dismiss()
+            default: break
+            }
+        }
+    }
+
+    /// The exact text that got typed somewhere — verbatim words, or note line.
+    private var voicePayload: String? {
+        guard let intent = voice.lastIntent else { return nil }
+        switch intent.action {
+        case "terminal_send", "terminal_new":
+            let dir = intent.cwd.map { URL(fileURLWithPath: $0).lastPathComponent + " › " } ?? ""
+            guard let sent = voice.lastSent else { return intent.cwd.map { "shell in \($0)" } }
+            return dir + sent
+        case "note":
+            return intent.noteText
+        default:
+            return nil
+        }
+    }
+
+    /// Hand the router a snapshot of the workspace and the executor that
+    /// carries out whatever it decides.
+    private func wireVoice() {
+        voice.gatherContext = { [weak store, weak hub, weak notes] in
+            guard let store, let hub, let notes else { return "" }
+            let terminals: [(id: String, title: String, session: String?)] = store.cards
+                .filter { $0.kind == .terminal }
+                .map { (String($0.id.uuidString.prefix(8)).lowercased(), $0.title, $0.session) }
+            let source = hub.source
+            let radioState = "\(hub.radio.isPlaying ? "playing" : "paused")\(hub.radio.isMuted ? ", muted" : "")"
+            let tracks = hub.music.tracks.map { "\($0.index): \($0.title) — \($0.artist)" }
+            let stations = hub.music.stations.map(\.name)
+            let nowPlaying = hub.music.hasTrack
+                ? "\(hub.music.title) — \(hub.music.artist) (\(hub.music.isPlaying ? "playing" : "paused"))"
+                : "nothing"
+            let noteNames = notes.notes.map(\.name)
+
+            return await Task.detached {
+                var out = "TERMINALS (id · title · cwd · recent output):\n"
+                if terminals.isEmpty { out += "  none open\n" }
+                for t in terminals {
+                    var cwd = "?"
+                    var tail = ""
+                    if let s = t.session {
+                        cwd = TerminalRegistry.tmuxOutput(
+                            ["display-message", "-p", "-t", "=" + s, "#{pane_current_path}"]
+                        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+                        let lines = (TerminalRegistry.tmuxOutput(["capture-pane", "-p", "-t", "=" + s]) ?? "")
+                            .split(separator: "\n", omittingEmptySubsequences: true)
+                            .suffix(10)
+                            .map { String($0.prefix(160)) }
+                        tail = lines.joined(separator: "\n    ")
+                    }
+                    out += "- id \(t.id) · \(t.title) · \(cwd)\n    \(tail)\n"
+                }
+                out += "\nPROJECTS he can open a terminal in:\n"
+                out += VoiceController.listProjects().map { "- \($0)" }.joined(separator: "\n")
+                out += "\n\nMEDIA CARD — showing: \(source.label)\n"
+                out += "- claude fm (YouTube livestream, \(radioState)): play/pause/mute only, "
+                out += "nothing to skip.\n"
+                out += "- soundcloud: now \(nowPlaying)\n  Stations: \(stations.joined(separator: ", "))\n"
+                out += "  Tracks:\n  " + (tracks.isEmpty ? "(none loaded)" : tracks.joined(separator: "\n  "))
+                out += "\n\nNOTES: \(noteNames.joined(separator: ", "))"
+                return out
+            }.value
+        }
+
+        voice.execute = { intent, spoken in
+            runVoiceIntent(intent, spoken: spoken)
+        }
+    }
+
+    private func runVoiceIntent(_ intent: VoiceIntent, spoken: String) -> String {
+        // His words go through untouched. "text" only carries the PREVIOUS
+        // turn's words after a clarifying exchange — never a rewrite.
+        let words = (intent.text?.isEmpty == false ? intent.text! : spoken)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch intent.action {
+        case "terminal_send":
+            guard let idPrefix = intent.terminalID?.lowercased(),
+                  let card = store.cards.first(where: {
+                      $0.kind == .terminal && $0.id.uuidString.lowercased().hasPrefix(idPrefix)
+                  })
+            else { return "couldn't find that terminal" }
+            guard !words.isEmpty else { return "nothing to send" }
+            var text = words
+            if intent.wrapClaude {
+                var cmd = "claude"
+                if let model = intent.claudeModel, ["haiku", "sonnet", "opus"].contains(model) {
+                    cmd += " --model " + model
+                }
+                text = cmd + " " + words.shellQuoted
+            }
+            store.raise(card.id)
+            voice.lastSent = text
+            TerminalRegistry.shared.send(to: card.id, text: text + "\r")
+            return intent.summary.isEmpty ? "→ \(card.title)" : intent.summary
+
+        case "terminal_new":
+            var parts: [String] = []
+            if let cwd = intent.cwd, !cwd.isEmpty { parts.append("cd " + cwd.shellQuoted) }
+            if intent.wrapClaude, !words.isEmpty {
+                var cmd = "claude"
+                if let model = intent.claudeModel, ["haiku", "sonnet", "opus"].contains(model) {
+                    cmd += " --model " + model
+                }
+                cmd += " " + words.shellQuoted
+                parts.append(cmd)
+            }
+            let title = intent.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
+            voice.lastSent = parts.last
+            withAnimation(Self.tidySpring) {
+                store.addTerminal(
+                    bootCommand: parts.isEmpty ? nil : parts.joined(separator: " && "),
+                    title: title
+                )
+            }
+            return intent.summary.isEmpty ? "new terminal" : intent.summary
+
+        case "player":
+            // Anything that names tracks or playlists is SoundCloud by
+            // definition; the livestream only takes transport commands.
+            switch intent.playerAction {
+            case "radio": hub.select(.radio); hub.radio.catchUp()
+            case "soundcloud": hub.select(.soundcloud)
+            case "mute": hub.radio.setMuted(true)
+            case "unmute": hub.radio.setMuted(false)
+            case "toggle":
+                hub.source == .radio ? hub.radio.toggle() : hub.music.toggle()
+            case "play":
+                hub.source == .radio ? hub.radio.catchUp() : hub.music.toggle()
+            case "pause":
+                hub.source == .radio ? hub.radio.pause() : hub.music.pause()
+            case "next":
+                guard hub.source == .soundcloud else { return "claude fm is a livestream — nothing to skip" }
+                hub.music.next()
+            case "prev":
+                guard hub.source == .soundcloud else { return "claude fm is a livestream — nothing to skip" }
+                hub.music.prev()
+            case "play_track":
+                guard let index = intent.trackIndex else { return "which track?" }
+                hub.select(.soundcloud)
+                hub.music.skip(to: index)
+            case "station":
+                guard let name = intent.station?.lowercased(),
+                      let match = hub.music.stations.first(where: {
+                          $0.name.lowercased().contains(name)
+                      })
+                else { return "no station like that" }
+                hub.select(.soundcloud)
+                hub.music.select(match)
+            default: return "unknown player action"
+            }
+            return intent.summary.isEmpty ? hub.source.label : intent.summary
+
+        case "note":
+            guard let text = intent.noteText else { return "nothing to note" }
+            return notes.append(text, title: intent.noteTitle, toNoteNamed: intent.noteTarget)
+
+        default:
+            return intent.say ?? (intent.summary.isEmpty ? "not sure what to do" : intent.summary)
+        }
+    }
 }
 
 struct CardView: View {
     @Binding var card: Card
     let store: WorkspaceStore
-    let player: PlayerModel
+    @ObservedObject var hub: PlayerHub
     let notes: NotesStore
 
     @State private var dragStart: CGPoint?
     @State private var resizeStart: CGSize?
+
+    /// The livestream is 16:9 and the card rarely is — so the radio card drops
+    /// its glass entirely and the video floats on the wallpaper instead of
+    /// sitting in black bars.
+    private var floating: Bool { card.kind == .player && hub.source == .radio }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -152,20 +450,27 @@ struct CardView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: card.width, height: card.height)
-        .cardSurface()
+        .cardSurface(clear: floating)
         .overlay(alignment: .bottomTrailing) { resizeGrip }
         .offset(x: card.x, y: card.y)
         .simultaneousGesture(
-            TapGesture().onEnded { store.raise(card.id) }
+            TapGesture().onEnded {
+                store.raise(card.id)
+                if card.kind == .simulator { SimulatorDockController.shared.raise() }
+            }
         )
     }
 
     private var header: some View {
         HStack(spacing: 8) {
             Circle().fill(kindColor).frame(width: 7, height: 7)
-            Text(card.title)
-                .font(Theme.mono(11, weight: .medium))
-                .foregroundStyle(Theme.headerText)
+            if card.kind == .player {
+                PlayerSourceChips(hub: hub)
+            } else {
+                Text(card.title)
+                    .font(Theme.mono(11, weight: .medium))
+                    .foregroundStyle(Theme.headerText)
+            }
             Spacer()
             Button(action: { store.close(card.id) }) {
                 Image(systemName: "xmark")
@@ -176,7 +481,7 @@ struct CardView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 30)
-        .background(Color.white.opacity(0.03))
+        .background(Color.white.opacity(floating ? 0 : 0.03))
         .contentShape(Rectangle())
         .gesture(
             DragGesture(coordinateSpace: .global)
@@ -215,7 +520,7 @@ struct CardView: View {
     private var content: some View {
         switch card.kind {
         case .terminal:
-            TerminalPane(cardID: card.id, bootCommand: card.bootCommand)
+            TerminalPane(cardID: card.id, session: card.session, bootCommand: card.bootCommand)
                 .clipShape(
                     UnevenRoundedRectangle(
                         bottomLeadingRadius: Theme.cardRadius,
@@ -223,9 +528,27 @@ struct CardView: View {
                     )
                 )
         case .player:
-            PlayerCardView(model: player)
+            PlayerHostView(hub: hub)
+                .clipShape(
+                    UnevenRoundedRectangle(
+                        bottomLeadingRadius: floating ? 0 : Theme.cardRadius,
+                        bottomTrailingRadius: floating ? 0 : Theme.cardRadius
+                    )
+                )
         case .notes:
             NotesCardView(store: notes)
+        case .simulator:
+            SimulatorDockView()
+                .clipShape(
+                    UnevenRoundedRectangle(
+                        bottomLeadingRadius: Theme.cardRadius,
+                        bottomTrailingRadius: Theme.cardRadius
+                    )
+                )
+        case .github:
+            GitHubHelperView()
+        case .claudeUsage:
+            ClaudeUsageView()
         }
     }
 
@@ -234,6 +557,9 @@ struct CardView: View {
         case .terminal: return Color(red: 0.45, green: 0.85, blue: 0.55)
         case .player: return Theme.accent
         case .notes: return Color(red: 0.55, green: 0.65, blue: 0.95)
+        case .simulator: return Color(red: 0.95, green: 0.55, blue: 0.35)
+        case .github: return Color(red: 0.75, green: 0.75, blue: 0.78)
+        case .claudeUsage: return Color(red: 0.90, green: 0.50, blue: 0.35)
         }
     }
 }
