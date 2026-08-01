@@ -32,6 +32,12 @@ PLIST
 
 codesign --force -s - "$APP" 2>/dev/null || true
 
+# First-run wallpaper install (never overwrites the user's choice)
+if [[ -f assets/wallpaper.jpg && ! -f "$HOME/Documents/CNVS/wallpaper.jpg" ]]; then
+    mkdir -p "$HOME/Documents/CNVS"
+    cp assets/wallpaper.jpg "$HOME/Documents/CNVS/wallpaper.jpg"
+fi
+
 if [[ "$1" != "--no-launch" ]]; then
     open "$APP"
 fi

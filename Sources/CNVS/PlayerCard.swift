@@ -7,6 +7,14 @@ struct Station: Codable, Identifiable, Equatable {
     var url: String
 }
 
+struct Track: Identifiable, Equatable {
+    let index: Int
+    let title: String
+    let artist: String
+    let durMS: Double
+    var id: Int { index }
+}
+
 @MainActor
 final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     @Published var title: String = ""
@@ -20,6 +28,8 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     @Published var stations: [Station] = []
     @Published var currentStationID: UUID?
     @Published var addingStation = false
+    @Published var tracks: [Track] = []
+    @Published var currentIndex: Int?
 
     let webView: WKWebView
 
@@ -44,6 +54,8 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
            !last.isEmpty {
             Task { await self.addStation(urlString: last, andPlay: false) }
         }
+        // Repair names saved before title cleanup existed ("?", "house by harrison", …).
+        Task { await self.refreshStationNames() }
     }
 
     // MARK: stations
@@ -57,15 +69,25 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
             }
             return
         }
-        let name = await Self.fetchTitle(for: trimmed) ?? Self.nameFromSlug(trimmed)
+        let name = await Self.fetchCleanTitle(for: trimmed) ?? Self.nameFromSlug(trimmed)
         let station = Station(id: UUID(), name: name, url: trimmed)
         stations.append(station)
         saveStations()
         if andPlay { select(station) }
     }
 
+    func refreshStationNames() async {
+        for station in stations {
+            if let clean = await Self.fetchCleanTitle(for: station.url), clean != station.name {
+                renameStation(station, to: clean)
+            }
+        }
+    }
+
     func select(_ station: Station) {
         currentStationID = station.id
+        tracks = []
+        currentIndex = nil
         load(urlString: station.url)
     }
 
@@ -87,23 +109,43 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
         }
     }
 
-    /// Playlist/track title via SoundCloud's public oEmbed endpoint — no API key needed.
-    private static func fetchTitle(for url: String) async -> String? {
+    /// Playlist title via SoundCloud's public oEmbed endpoint, with the
+    /// trailing "by <author>" stripped so a chip reads just "House".
+    private static func fetchCleanTitle(for url: String) async -> String? {
         var comps = URLComponents(string: "https://soundcloud.com/oembed")!
         comps.queryItems = [.init(name: "format", value: "json"), .init(name: "url", value: url)]
         guard let endpoint = comps.url else { return nil }
-        struct OEmbed: Decodable { let title: String? }
+        struct OEmbed: Decodable {
+            let title: String?
+            let author_name: String?
+        }
         guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
               let embed = try? JSONDecoder().decode(OEmbed.self, from: data),
-              let title = embed.title, !title.isEmpty else { return nil }
-        return title
+              var title = embed.title, !title.isEmpty else { return nil }
+        if let author = embed.author_name, !author.isEmpty {
+            for suffix in [" by \(author)", " – by \(author)", " - by \(author)"]
+            where title.lowercased().hasSuffix(suffix.lowercased()) {
+                title = String(title.dropLast(suffix.count))
+            }
+        }
+        let cleaned = Self.stripDecorations(title)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    /// "House 🔗" → "House": drop emoji/symbols from the ends, keep words.
+    private static func stripDecorations(_ s: String) -> String {
+        var chars = Array(s)
+        while let f = chars.first, !(f.isLetter || f.isNumber) { chars.removeFirst() }
+        while let l = chars.last, !(l.isLetter || l.isNumber) { chars.removeLast() }
+        return String(chars).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func nameFromSlug(_ url: String) -> String {
         let slug = url.split(separator: "?").first
             .flatMap { $0.split(separator: "/").last }
             .map(String.init) ?? "playlist"
-        return slug.replacingOccurrences(of: "-", with: " ")
+        let name = stripDecorations(slug.replacingOccurrences(of: "-", with: " "))
+        return name.isEmpty ? "playlist" : name
     }
 
     // MARK: playback
@@ -119,6 +161,7 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     func toggle() { webView.evaluateJavaScript("toggle()") }
     func next() { webView.evaluateJavaScript("next()") }
     func prev() { webView.evaluateJavaScript("prev()") }
+    func skip(to index: Int) { webView.evaluateJavaScript("skipTo(\(index))") }
 
     func seek(to fraction: Double) {
         webView.evaluateJavaScript("seekRel(\(max(0, min(1, fraction))))")
@@ -147,6 +190,20 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
                 } else {
                     artworkURL = nil
                 }
+            case "sounds":
+                if let items = body["items"] as? [[String: Any]] {
+                    tracks = items.compactMap { item in
+                        guard let i = item["i"] as? Int else { return nil }
+                        return Track(
+                            index: i,
+                            title: item["title"] as? String ?? "",
+                            artist: item["artist"] as? String ?? "",
+                            durMS: item["dur"] as? Double ?? 0
+                        )
+                    }
+                }
+            case "index":
+                currentIndex = body["ix"] as? Int
             default: break
             }
         }
@@ -167,8 +224,8 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     let widget = null;
     function post(m){ try { window.webkit.messageHandlers.player.postMessage(m) } catch(e){} }
     function bind(){
-      widget.bind(SC.Widget.Events.READY, () => { sound(); });
-      widget.bind(SC.Widget.Events.PLAY, () => { post({t:'play'}); sound(); });
+      widget.bind(SC.Widget.Events.READY, () => { sound(); sounds(); index(); });
+      widget.bind(SC.Widget.Events.PLAY, () => { post({t:'play'}); sound(); index(); sounds(); });
       widget.bind(SC.Widget.Events.PAUSE, () => post({t:'pause'}));
       widget.bind(SC.Widget.Events.PLAY_PROGRESS, e => post({t:'progress', ms:e.currentPosition}));
       widget.bind(SC.Widget.Events.FINISH, () => post({t:'finish'}));
@@ -179,7 +236,7 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
         f.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(url) + '&auto_play=true&visual=false&show_teaser=false';
         f.onload = () => { if (!widget) { widget = SC.Widget(f); bind(); } };
       } else {
-        widget.load(url, {auto_play: true, callback: () => { sound(); }});
+        widget.load(url, {auto_play: true, callback: () => { sound(); sounds(); index(); }});
       }
     }
     function sound(){
@@ -187,9 +244,18 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
         if (s) post({t:'sound', title:s.title||'', artist:(s.user&&s.user.username)||'', art:s.artwork_url||'', dur:s.duration||0});
       });
     }
+    function sounds(){
+      widget.getSounds(list => {
+        post({t:'sounds', items:(list||[]).map((s,i) => ({
+          i:i, title:(s&&s.title)||'', artist:(s&&s.user&&s.user.username)||'', dur:(s&&s.duration)||0
+        }))});
+      });
+    }
+    function index(){ widget.getCurrentSoundIndex(ix => post({t:'index', ix:ix})); }
     function toggle(){ if (widget) widget.toggle(); }
     function next(){ if (widget) widget.next(); }
     function prev(){ if (widget) widget.prev(); }
+    function skipTo(i){ if (widget) widget.skip(i); }
     function seekRel(f){ if (widget) widget.getDuration(d => widget.seekTo(d*f)); }
     </script></body></html>
     """
@@ -207,7 +273,7 @@ struct PlayerCardView: View {
     @FocusState private var urlFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             stationsRow
 
             if model.addingStation || model.stations.isEmpty {
@@ -217,6 +283,9 @@ struct PlayerCardView: View {
             if model.hasTrack {
                 nowPlaying
                 transport
+                if model.tracks.count > 1 {
+                    trackList
+                }
             } else {
                 Spacer()
                 HStack {
@@ -307,24 +376,25 @@ struct PlayerCardView: View {
     }
 
     private var nowPlaying: some View {
-        HStack(alignment: .center, spacing: 14) {
-            artwork
-            VStack(alignment: .leading, spacing: 5) {
-                Text(model.title.isEmpty ? "Loading…" : model.title)
-                    .font(Theme.mono(13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
-                    .lineLimit(2)
-                Text(model.artist)
-                    .font(Theme.mono(10))
-                    .foregroundStyle(Theme.headerText)
-                    .lineLimit(1)
-                Spacer(minLength: 2)
-                WaveformView(isPlaying: model.isPlaying, progress: model.progress)
-                    .frame(height: 26)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                artwork
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(model.title.isEmpty ? "Loading…" : model.title)
+                        .font(Theme.mono(12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(model.artist)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.headerText)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            WaveformView(isPlaying: model.isPlaying, progress: model.progress)
+                .frame(height: 22)
         }
-        .frame(maxHeight: .infinity)
     }
 
     private var transport: some View {
@@ -349,6 +419,52 @@ struct PlayerCardView: View {
             ProgressBar(progress: model.progress) { model.seek(to: $0) }
                 .frame(height: 4)
         }
+    }
+
+    private var trackList: some View {
+        ScrollViewReader { proxy in
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 1) {
+                    ForEach(model.tracks) { track in
+                        let current = model.currentIndex == track.index
+                        Button(action: { model.skip(to: track.index) }) {
+                            HStack(spacing: 8) {
+                                Text(String(format: "%02d", track.index + 1))
+                                    .font(Theme.mono(9))
+                                    .foregroundStyle(current ? Theme.accent : Theme.headerText.opacity(0.7))
+                                Text(track.title.isEmpty ? "track \(track.index + 1)" : track.title)
+                                    .font(Theme.mono(10, weight: current ? .semibold : .regular))
+                                    .foregroundStyle(current ? Theme.accent : .white.opacity(0.80))
+                                    .lineLimit(1)
+                                Spacer(minLength: 6)
+                                if current && model.isPlaying {
+                                    Image(systemName: "waveform")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(Theme.accent)
+                                }
+                                Text(fmt(track.durMS))
+                                    .font(Theme.mono(9))
+                                    .foregroundStyle(Theme.headerText.opacity(0.7))
+                                    .monospacedDigit()
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(current ? Color.white.opacity(0.07) : .clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .id(track.index)
+                    }
+                }
+            }
+            .onChange(of: model.currentIndex) {
+                if let ix = model.currentIndex {
+                    withAnimation { proxy.scrollTo(ix, anchor: .center) }
+                }
+            }
+        }
+        .frame(maxHeight: .infinity)
     }
 
     private func skipButton(_ symbol: String, action: @escaping () -> Void) -> some View {
@@ -379,17 +495,18 @@ struct PlayerCardView: View {
                 }
             }
         }
-        .frame(width: 88, height: 88)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(width: 56, height: 56)
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
     }
 
+    private func fmt(_ ms: Double) -> String {
+        let s = Int(ms / 1000)
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
     private var timeLabel: String {
-        func fmt(_ ms: Double) -> String {
-            let s = Int(ms / 1000)
-            return String(format: "%d:%02d", s / 60, s % 60)
-        }
-        return "\(fmt(model.positionMS)) / \(fmt(model.durationMS))"
+        "\(fmt(model.positionMS)) / \(fmt(model.durationMS))"
     }
 }
 

@@ -189,7 +189,6 @@ struct CardView: View {
         switch card.kind {
         case .terminal:
             TerminalPane(cardID: card.id, bootCommand: card.bootCommand)
-                .background(Theme.terminalBackground)
                 .clipShape(
                     UnevenRoundedRectangle(
                         bottomLeadingRadius: Theme.cardRadius,

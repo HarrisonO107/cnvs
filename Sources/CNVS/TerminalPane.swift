@@ -13,7 +13,7 @@ final class TerminalRegistry {
 
         let tv = LocalProcessTerminalView(frame: .init(x: 0, y: 0, width: 600, height: 400))
         tv.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-        tv.nativeBackgroundColor = NSColor(red: 0.05, green: 0.07, blue: 0.11, alpha: 1)
+        tv.nativeBackgroundColor = .clear
         tv.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
 
         var env = ProcessInfo.processInfo.environment
@@ -27,6 +27,11 @@ final class TerminalRegistry {
             environment: envList,
             currentDirectory: FileManager.default.homeDirectoryForCurrentUser.path
         )
+
+        // SwiftTerm only pushes nativeBackgroundColor to its layer once, in
+        // setupOptions() — assigning the color later never reaches the layer,
+        // so stamp it clear ourselves or the pane stays opaque.
+        tv.layer?.backgroundColor = NSColor.clear.cgColor
 
         if let boot = bootCommand, !boot.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {

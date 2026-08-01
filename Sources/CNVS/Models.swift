@@ -43,8 +43,8 @@ final class WorkspaceStore: ObservableObject {
     static func defaultLayout() -> [Card] {
         [
             Card(id: UUID(), kind: .terminal, title: "terminal", x: 40, y: 40, width: 760, height: 620, z: 1),
-            Card(id: UUID(), kind: .player, title: "player", x: 830, y: 40, width: 460, height: 300, z: 2),
-            Card(id: UUID(), kind: .notes, title: "notes", x: 830, y: 360, width: 460, height: 300, z: 3),
+            Card(id: UUID(), kind: .player, title: "player", x: 830, y: 40, width: 460, height: 430, z: 2),
+            Card(id: UUID(), kind: .notes, title: "notes", x: 830, y: 490, width: 460, height: 270, z: 3),
         ]
     }
 
