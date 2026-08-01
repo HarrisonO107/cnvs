@@ -3,13 +3,18 @@
 set -e
 cd "$(dirname "$0")"
 
-swift build -c release
+# Scratch dir OUTSIDE iCloud: this repo lives on the synced Desktop, and iCloud
+# evicts .build (8k+ dataless files observed 2026-08-01) — evicted reads block
+# and swift-build hangs silently at "Planning build".
+SCRATCH="$HOME/work/build/cnvs-build"
+mkdir -p "$SCRATCH"
+swift build -c release --scratch-path "$SCRATCH"
 
 APP=build/CNVS.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-cp .build/release/CNVS "$APP/Contents/MacOS/CNVS"
+cp "$SCRATCH/release/CNVS" "$APP/Contents/MacOS/CNVS"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -26,11 +31,22 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>com.hfjoandco.cnvs</string>
+            <key>CFBundleURLSchemes</key><array><string>cnvs</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
 
 codesign --force -s - "$APP" 2>/dev/null || true
+
+# Register the cnvs:// URL scheme with LaunchServices (the build listener opens
+# phone terminals with `open cnvs://terminal?session=...`).
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
 
 # First-run wallpaper install (never overwrites the user's choice)
 if [[ -f assets/wallpaper.jpg && ! -f "$HOME/Documents/CNVS/wallpaper.jpg" ]]; then

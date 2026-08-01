@@ -34,6 +34,31 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cnvsFocusCommandBar)) { _ in
             commandFocused = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsTidy)) { _ in
+            tidy()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsOpenPhoneTerminal)) { _ in
+            openPhoneTerminals()
+        }
+        .onAppear { openPhoneTerminals() }
+    }
+
+    private func tidy() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            store.tidy()
+        }
+    }
+
+    /// Terminals the phone asked for via cnvs://terminal?session=… — each pane
+    /// attaches to (or revives) the listener-created tmux session, so the phone's
+    /// ttyd viewer and this pane are the same shell.
+    private func openPhoneTerminals() {
+        for session in PhoneTerminalRequests.shared.drain() {
+            store.addTerminal(
+                bootCommand: "exec /opt/homebrew/bin/tmux new-session -A -s \(session)",
+                title: "phone·\(session.suffix(4))"
+            )
+        }
     }
 
     @State private var lastSize: CGSize?
@@ -43,6 +68,7 @@ struct RootView: View {
     private func clamp(to size: CGSize) {
         guard size.width > 300, size.height > 200 else { return }
         defer { lastSize = size }
+        store.canvasSize = size
 
         var scaleW: CGFloat = 1, scaleH: CGFloat = 1
         if let old = lastSize, old.width > 300, old.height > 200,
@@ -91,6 +117,7 @@ struct RootView: View {
             barButton("terminal.fill", help: "new terminal (⌘T)") { store.addTerminal() }
             barButton("music.note", help: "toggle player") { store.togglePanel(.player) }
             barButton("note.text", help: "toggle notes") { store.togglePanel(.notes) }
+            barButton("square.grid.3x3", help: "tidy — snap to grid (⌘G)") { tidy() }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
