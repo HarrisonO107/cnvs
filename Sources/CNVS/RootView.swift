@@ -36,12 +36,29 @@ struct RootView: View {
         }
     }
 
+    @State private var lastSize: CGSize?
+
+    /// Scale the whole layout with the window (fullscreen shouldn't strand
+    /// cards in a corner), then keep everything inside the visible frame.
     private func clamp(to size: CGSize) {
         guard size.width > 300, size.height > 200 else { return }
+        defer { lastSize = size }
+
+        var scaleW: CGFloat = 1, scaleH: CGFloat = 1
+        if let old = lastSize, old.width > 300, old.height > 200,
+           abs(old.width - size.width) + abs(old.height - size.height) > 1 {
+            scaleW = size.width / old.width
+            scaleH = size.height / old.height
+        }
+
         for i in store.cards.indices {
             var c = store.cards[i]
-            c.width = min(c.width, size.width - 24)
-            c.height = min(c.height, size.height - 24)
+            c.x *= scaleW
+            c.width *= scaleW
+            c.y *= scaleH
+            c.height *= scaleH
+            c.width = max(280, min(c.width, size.width - 24))
+            c.height = max(180, min(c.height, size.height - 24))
             c.x = max(12, min(c.x, size.width - c.width - 12))
             c.y = max(0, min(c.y, size.height - c.height - 12))
             store.cards[i] = c
@@ -197,41 +214,24 @@ struct CardView: View {
 
 struct Wallpaper: View {
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                if let img = Self.customWallpaper {
+        Group {
+            if let img = Self.customWallpaper {
+                GeometryReader { geo in
                     Image(nsImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
                         .overlay(Color.black.opacity(0.35))
-                } else {
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.10, green: 0.14, blue: 0.24),
-                            Color(red: 0.05, green: 0.08, blue: 0.16),
-                            Color(red: 0.03, green: 0.04, blue: 0.09),
-                        ],
-                        startPoint: .top, endPoint: .bottom
-                    )
-                    RadialGradient(
-                        colors: [Color(red: 0.35, green: 0.42, blue: 0.60).opacity(0.35), .clear],
-                        center: .init(x: 0.75, y: 0.15),
-                        startRadius: 0, endRadius: geo.size.width * 0.7
-                    )
-                    RadialGradient(
-                        colors: [Theme.accent.opacity(0.08), .clear],
-                        center: .init(x: 0.2, y: 0.9),
-                        startRadius: 0, endRadius: geo.size.width * 0.5
-                    )
                 }
+            } else {
+                NightSky()
             }
         }
         .ignoresSafeArea()
     }
 
-    // Drop a wallpaper at ~/Documents/CNVS/wallpaper.(jpg|png|heic) to replace the gradient.
+    // Drop a wallpaper at ~/Documents/CNVS/wallpaper.(jpg|png|heic) to replace the sky.
     static let customWallpaper: NSImage? = {
         let base = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents/CNVS")
@@ -241,4 +241,91 @@ struct Wallpaper: View {
         }
         return nil
     }()
+}
+
+/// Procedural animated night sky: slow-drifting mesh gradient, twinkling
+/// stars, warm horizon glow, vignette.
+struct NightSky: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 8.0)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            GeometryReader { geo in
+                ZStack {
+                    mesh(t)
+                    StarField(t: t)
+                        .blendMode(.screen)
+                    RadialGradient(
+                        colors: [Color(red: 0.45, green: 0.52, blue: 0.75).opacity(0.20), .clear],
+                        center: .init(x: 0.72, y: 0.10),
+                        startRadius: 0, endRadius: geo.size.width * 0.55
+                    )
+                    .blendMode(.screen)
+                    RadialGradient(
+                        colors: [Theme.accent.opacity(0.13), .clear],
+                        center: .init(x: 0.30, y: 1.02),
+                        startRadius: 0, endRadius: geo.size.width * 0.55
+                    )
+                    .blendMode(.screen)
+                    RadialGradient(
+                        colors: [.clear, .black.opacity(0.55)],
+                        center: .center,
+                        startRadius: min(geo.size.width, geo.size.height) * 0.35,
+                        endRadius: max(geo.size.width, geo.size.height) * 0.80
+                    )
+                }
+            }
+        }
+    }
+
+    private func mesh(_ t: Double) -> some View {
+        func drift(_ phase: Double, _ speed: Double, _ amp: Float) -> Float {
+            Float(sin(t * speed + phase)) * amp
+        }
+        return MeshGradient(
+            width: 3, height: 3,
+            points: [
+                [0, 0], [0.5 + drift(0.0, 0.050, 0.08), 0], [1, 0],
+                [0, 0.5 + drift(1.3, 0.040, 0.06)],
+                [0.5 + drift(2.1, 0.033, 0.14), 0.5 + drift(0.7, 0.047, 0.10)],
+                [1, 0.5 + drift(3.0, 0.044, 0.06)],
+                [0, 1], [0.5 + drift(4.2, 0.037, 0.08), 1], [1, 1],
+            ],
+            colors: [
+                Color(red: 0.030, green: 0.045, blue: 0.100),
+                Color(red: 0.060, green: 0.090, blue: 0.190),
+                Color(red: 0.035, green: 0.050, blue: 0.110),
+                Color(red: 0.050, green: 0.070, blue: 0.150),
+                Color(red: 0.105, green: 0.135, blue: 0.260),
+                Color(red: 0.055, green: 0.072, blue: 0.140),
+                Color(red: 0.016, green: 0.022, blue: 0.045),
+                Color(red: 0.085, green: 0.068, blue: 0.085),
+                Color(red: 0.016, green: 0.022, blue: 0.045),
+            ]
+        )
+    }
+}
+
+struct StarField: View {
+    let t: Double
+
+    var body: some View {
+        Canvas { ctx, size in
+            var seed: UInt64 = 0x51F3_9A2B_77C4_D01E
+            func rnd() -> Double {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return Double((seed >> 33) & 0xFF_FFFF) / Double(0xFF_FFFF)
+            }
+            for _ in 0..<170 {
+                let x = rnd() * size.width
+                let y = pow(rnd(), 1.7) * size.height * 0.80 // denser up top
+                let r = 0.4 + rnd() * 1.2
+                let phase = rnd() * .pi * 2
+                let speed = 0.25 + rnd() * 1.1
+                let base = 0.10 + rnd() * 0.55
+                let twinkle = 0.55 + 0.45 * sin(t * speed + phase)
+                let rect = CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)
+                ctx.fill(Path(ellipseIn: rect), with: .color(.white.opacity(base * twinkle)))
+            }
+        }
+    }
 }

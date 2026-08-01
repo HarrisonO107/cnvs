@@ -1,9 +1,9 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 import PackageDescription
 
 let package = Package(
     name: "CNVS",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.2.0"),
     ],
@@ -11,7 +11,8 @@ let package = Package(
         .executableTarget(
             name: "CNVS",
             dependencies: ["SwiftTerm"],
-            path: "Sources/CNVS"
+            path: "Sources/CNVS",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )

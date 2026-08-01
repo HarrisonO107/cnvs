@@ -1,6 +1,12 @@
 import SwiftUI
 import WebKit
 
+struct Station: Codable, Identifiable, Equatable {
+    let id: UUID
+    var name: String
+    var url: String
+}
+
 @MainActor
 final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     @Published var title: String = ""
@@ -11,10 +17,14 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
     @Published var durationMS: Double = 0
     @Published var positionMS: Double = 0
     @Published var hasTrack = false
+    @Published var stations: [Station] = []
+    @Published var currentStationID: UUID?
+    @Published var addingStation = false
 
     let webView: WKWebView
 
     private static let lastURLKey = "cnvs.player.lastURL"
+    private static let stationsKey = "cnvs.player.stations"
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -23,22 +33,92 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
         super.init()
         config.userContentController.add(self, name: "player")
         webView.loadHTMLString(Self.bridgeHTML, baseURL: URL(string: "https://cnvs.local"))
+
+        if let data = UserDefaults.standard.data(forKey: Self.stationsKey),
+           let saved = try? JSONDecoder().decode([Station].self, from: data) {
+            stations = saved
+        }
+        // Migrate a link pasted before stations existed.
+        if stations.isEmpty,
+           let last = UserDefaults.standard.string(forKey: Self.lastURLKey),
+           !last.isEmpty {
+            Task { await self.addStation(urlString: last, andPlay: false) }
+        }
     }
 
-    var lastURL: String {
-        UserDefaults.standard.string(forKey: Self.lastURLKey) ?? ""
+    // MARK: stations
+
+    func addStation(urlString: String, andPlay: Bool = true) async {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.contains("soundcloud.com") else { return }
+        guard !stations.contains(where: { $0.url == trimmed }) else {
+            if andPlay, let existing = stations.first(where: { $0.url == trimmed }) {
+                select(existing)
+            }
+            return
+        }
+        let name = await Self.fetchTitle(for: trimmed) ?? Self.nameFromSlug(trimmed)
+        let station = Station(id: UUID(), name: name, url: trimmed)
+        stations.append(station)
+        saveStations()
+        if andPlay { select(station) }
     }
+
+    func select(_ station: Station) {
+        currentStationID = station.id
+        load(urlString: station.url)
+    }
+
+    func removeStation(_ station: Station) {
+        stations.removeAll { $0.id == station.id }
+        if currentStationID == station.id { currentStationID = nil }
+        saveStations()
+    }
+
+    func renameStation(_ station: Station, to newName: String) {
+        guard let idx = stations.firstIndex(where: { $0.id == station.id }) else { return }
+        stations[idx].name = newName
+        saveStations()
+    }
+
+    private func saveStations() {
+        if let data = try? JSONEncoder().encode(stations) {
+            UserDefaults.standard.set(data, forKey: Self.stationsKey)
+        }
+    }
+
+    /// Playlist/track title via SoundCloud's public oEmbed endpoint — no API key needed.
+    private static func fetchTitle(for url: String) async -> String? {
+        var comps = URLComponents(string: "https://soundcloud.com/oembed")!
+        comps.queryItems = [.init(name: "format", value: "json"), .init(name: "url", value: url)]
+        guard let endpoint = comps.url else { return nil }
+        struct OEmbed: Decodable { let title: String? }
+        guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
+              let embed = try? JSONDecoder().decode(OEmbed.self, from: data),
+              let title = embed.title, !title.isEmpty else { return nil }
+        return title
+    }
+
+    private static func nameFromSlug(_ url: String) -> String {
+        let slug = url.split(separator: "?").first
+            .flatMap { $0.split(separator: "/").last }
+            .map(String.init) ?? "playlist"
+        return slug.replacingOccurrences(of: "-", with: " ")
+    }
+
+    // MARK: playback
 
     func load(urlString: String) {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains("soundcloud.com") else { return }
         UserDefaults.standard.set(trimmed, forKey: Self.lastURLKey)
-        let js = "load(\(Self.jsString(trimmed)))"
-        webView.evaluateJavaScript(js)
+        webView.evaluateJavaScript("load(\(Self.jsString(trimmed)))")
         hasTrack = true
     }
 
     func toggle() { webView.evaluateJavaScript("toggle()") }
+    func next() { webView.evaluateJavaScript("next()") }
+    func prev() { webView.evaluateJavaScript("prev()") }
 
     func seek(to fraction: Double) {
         webView.evaluateJavaScript("seekRel(\(max(0, min(1, fraction))))")
@@ -51,7 +131,6 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
             case "play": isPlaying = true
             case "pause": isPlaying = false
             case "finish":
-                isPlaying = false
                 progress = 0
             case "progress":
                 if let ms = body["ms"] as? Double {
@@ -109,6 +188,8 @@ final class PlayerModel: NSObject, ObservableObject, WKScriptMessageHandler {
       });
     }
     function toggle(){ if (widget) widget.toggle(); }
+    function next(){ if (widget) widget.next(); }
+    function prev(){ if (widget) widget.prev(); }
     function seekRel(f){ if (widget) widget.getDuration(d => widget.seekTo(d*f)); }
     </script></body></html>
     """
@@ -126,71 +207,31 @@ struct PlayerCardView: View {
     @FocusState private var urlFocused: Bool
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "link")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.headerText)
-                TextField("Paste a SoundCloud link…", text: $urlField)
-                    .textFieldStyle(.plain)
-                    .font(Theme.mono(11))
-                    .foregroundStyle(.white.opacity(0.85))
-                    .focused($urlFocused)
-                    .onSubmit {
-                        model.load(urlString: urlField)
-                        urlFocused = false
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            stationsRow
+
+            if model.addingStation || model.stations.isEmpty {
+                linkField
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.white.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             if model.hasTrack {
-                HStack(alignment: .top, spacing: 14) {
-                    artwork
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.title.isEmpty ? "Loading…" : model.title)
-                            .font(Theme.mono(13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .lineLimit(2)
-                        Text(model.artist)
-                            .font(Theme.mono(11))
-                            .foregroundStyle(Theme.headerText)
-                        Spacer(minLength: 4)
-                        WaveformView(isPlaying: model.isPlaying, progress: model.progress)
-                            .frame(height: 34)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                HStack(spacing: 12) {
-                    Button(action: { model.toggle() }) {
-                        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.black.opacity(0.85))
-                            .frame(width: 34, height: 34)
-                            .background(Theme.accent)
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Text(timeLabel)
-                        .font(Theme.mono(10))
-                        .foregroundStyle(Theme.headerText)
-
-                    ProgressBar(progress: model.progress) { model.seek(to: $0) }
-                        .frame(height: 4)
-                }
+                nowPlaying
+                transport
             } else {
                 Spacer()
-                VStack(spacing: 6) {
-                    Image(systemName: "waveform")
-                        .font(.system(size: 26))
-                        .foregroundStyle(Theme.accent.opacity(0.7))
-                    Text("drop a soundcloud link above")
-                        .font(Theme.mono(11))
-                        .foregroundStyle(Theme.headerText)
+                HStack {
+                    Spacer()
+                    VStack(spacing: 6) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 24))
+                            .foregroundStyle(Theme.accent.opacity(0.6))
+                        Text(model.stations.isEmpty
+                             ? "add a soundcloud playlist"
+                             : "pick a station")
+                            .font(Theme.mono(11))
+                            .foregroundStyle(Theme.headerText)
+                    }
+                    Spacer()
                 }
                 Spacer()
             }
@@ -199,10 +240,127 @@ struct PlayerCardView: View {
                 .frame(width: 2, height: 2)
                 .opacity(0.01)
         }
-        .padding(12)
-        .onAppear {
-            if urlField.isEmpty { urlField = model.lastURL }
+        .padding(14)
+    }
+
+    private var stationsRow: some View {
+        HStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(model.stations) { station in
+                        let active = model.currentStationID == station.id
+                        Button(action: { model.select(station) }) {
+                            Text(station.name)
+                                .font(Theme.mono(10, weight: active ? .semibold : .regular))
+                                .lineLimit(1)
+                                .foregroundStyle(active ? Color.black.opacity(0.85) : .white.opacity(0.75))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(active ? Theme.accent : Color.white.opacity(0.08))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Remove") { model.removeStation(station) }
+                        }
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+            Button(action: {
+                model.addingStation.toggle()
+                if model.addingStation { urlFocused = true }
+            }) {
+                Image(systemName: model.addingStation ? "xmark" : "plus")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Theme.headerText)
+                    .frame(width: 22, height: 22)
+                    .background(Color.white.opacity(0.07))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("add playlist")
         }
+    }
+
+    private var linkField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "link")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.headerText)
+            TextField("Paste a SoundCloud playlist or track link…", text: $urlField)
+                .textFieldStyle(.plain)
+                .font(Theme.mono(11))
+                .foregroundStyle(.white.opacity(0.85))
+                .focused($urlFocused)
+                .onSubmit {
+                    let url = urlField
+                    urlField = ""
+                    model.addingStation = false
+                    Task { await model.addStation(urlString: url) }
+                }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var nowPlaying: some View {
+        HStack(alignment: .center, spacing: 14) {
+            artwork
+            VStack(alignment: .leading, spacing: 5) {
+                Text(model.title.isEmpty ? "Loading…" : model.title)
+                    .font(Theme.mono(13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(2)
+                Text(model.artist)
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.headerText)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                WaveformView(isPlaying: model.isPlaying, progress: model.progress)
+                    .frame(height: 26)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var transport: some View {
+        HStack(spacing: 10) {
+            skipButton("backward.fill") { model.prev() }
+            Button(action: { model.toggle() }) {
+                Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.black.opacity(0.85))
+                    .frame(width: 32, height: 32)
+                    .background(Theme.accent)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            skipButton("forward.fill") { model.next() }
+
+            Text(timeLabel)
+                .font(Theme.mono(9))
+                .foregroundStyle(Theme.headerText)
+                .monospacedDigit()
+
+            ProgressBar(progress: model.progress) { model.seek(to: $0) }
+                .frame(height: 4)
+        }
+    }
+
+    private func skipButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.75))
+                .frame(width: 26, height: 26)
+                .background(Color.white.opacity(0.08))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var artwork: some View {
@@ -221,8 +379,9 @@ struct PlayerCardView: View {
                 }
             }
         }
-        .frame(width: 96, height: 96)
+        .frame(width: 88, height: 88)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
     }
 
     private var timeLabel: String {
@@ -237,7 +396,6 @@ struct PlayerCardView: View {
 struct WaveformView: View {
     let isPlaying: Bool
     let progress: Double
-    @State private var phase: Double = 0
 
     private let barCount = 36
 

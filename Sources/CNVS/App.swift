@@ -4,7 +4,7 @@ struct CNVSApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        Window("CNVS", id: "main") {
             RootView()
                 .frame(minWidth: 1100, minHeight: 700)
                 .preferredColorScheme(.dark)

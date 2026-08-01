@@ -113,9 +113,10 @@ final class NotesStore: ObservableObject {
                 status = "failed: \(error.localizedDescription)"
             }
 
+            let finalStatus = status
             await MainActor.run { [weak self] in
                 self?.organizing = false
-                self?.organizeStatus = status
+                self?.organizeStatus = finalStatus
                 self?.refresh()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self?.organizeStatus = nil }
             }
