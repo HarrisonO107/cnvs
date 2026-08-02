@@ -15,8 +15,17 @@ struct RootView: View {
             GeometryReader { geo in
                 ZStack(alignment: .topLeading) {
                     ForEach($store.cards) { $card in
+                        // A fullscreen card's own glass is translucent by
+                        // design — with siblings left in place behind it,
+                        // their content bled straight through the blur.
+                        // Actually hiding them (not just outranking them in
+                        // z) is the only thing that reads as "this card owns
+                        // the screen now."
+                        let hidden = fullscreenID != nil && card.id != fullscreenID
                         CardView(card: $card, store: store, hub: hub, notes: notes)
                             .zIndex(card.z)
+                            .opacity(hidden ? 0 : 1)
+                            .allowsHitTesting(!hidden)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -61,12 +70,21 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cnvsSimulatorToggle)) { _ in
             withAnimation(Self.tidySpring) { store.togglePanel(.simulator) }
         }
+        // The device size only lands once the window is found, a beat after
+        // the card exists — re-tidy so the card fits the phone it's hosting.
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsSimulatorSized)) { _ in
+            withAnimation(Self.tidySpring) { store.tidy() }
+        }
         .onAppear {
             openPhoneTerminals()
             wireVoice()
             voice.resumeWakeIfEnabled()
+            SimulatorDockController.shared.adoptStrayFloatingWindow(
+                cardOpen: store.cards.contains { $0.kind == .simulator })
         }
     }
+
+    private var fullscreenID: UUID? { store.cards.first { $0.isFullscreen }?.id }
 
     static let tidySpring = Animation.spring(response: 0.35, dampingFraction: 0.85)
 
@@ -107,6 +125,14 @@ struct RootView: View {
 
         for i in store.cards.indices {
             var c = store.cards[i]
+            if c.isFullscreen {
+                c.x = WorkspaceStore.margin
+                c.y = WorkspaceStore.margin
+                c.width = size.width - 2 * WorkspaceStore.margin
+                c.height = size.height - 2 * WorkspaceStore.margin - WorkspaceStore.commandBarClearance
+                store.cards[i] = c
+                continue
+            }
             c.x *= scaleW
             c.width *= scaleW
             c.y *= scaleH
@@ -452,7 +478,9 @@ struct CardView: View {
         }
         .frame(width: card.width, height: card.height)
         .cardSurface(clear: floating)
-        .overlay(alignment: .bottomTrailing) { resizeGrip }
+        .overlay(alignment: .bottomTrailing) {
+            if !card.isFullscreen { resizeGrip }
+        }
         .offset(x: card.x, y: card.y)
         .simultaneousGesture(
             TapGesture().onEnded {
@@ -473,6 +501,17 @@ struct CardView: View {
                     .foregroundStyle(Theme.headerText)
             }
             Spacer()
+            Button(action: {
+                withAnimation(RootView.tidySpring) { store.toggleFullscreen(card.id) }
+            }) {
+                Image(systemName: card.isFullscreen
+                      ? "arrow.down.right.and.arrow.up.left"
+                      : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Theme.headerText)
+            }
+            .buttonStyle(.plain)
+            .help(card.isFullscreen ? "restore" : "fullscreen")
             Button(action: { store.close(card.id) }) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
@@ -487,6 +526,7 @@ struct CardView: View {
         .gesture(
             DragGesture(coordinateSpace: .global)
                 .onChanged { v in
+                    guard !card.isFullscreen else { return }
                     if dragStart == nil {
                         dragStart = CGPoint(x: card.x, y: card.y)
                         store.raise(card.id)

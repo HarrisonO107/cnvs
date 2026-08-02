@@ -18,6 +18,8 @@ struct Card: Identifiable, Codable {
     var session: String?
 
     var bootCommand: String? // not persisted
+    var isFullscreen: Bool = false // not persisted
+    var preFullscreenFrame: CGRect? // not persisted
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, x, y, width, height, z, session
@@ -34,6 +36,9 @@ final class WorkspaceStore: ObservableObject {
     static let gutter: CGFloat = 12
     /// Tiles stop short of the floating command bar at the bottom.
     static let commandBarClearance: CGFloat = 56
+    /// Card chrome above the content — matched to the header's fixed height so
+    /// the simulator card's content area comes out exactly device-sized.
+    static let simulatorHeader: CGFloat = 30
 
     /// Kept current by RootView; placement needs it to know where cards fit.
     var canvasSize = CGSize(width: 1380, height: 800)
@@ -91,12 +96,66 @@ final class WorkspaceStore: ObservableObject {
         cards[idx].z = top
     }
 
+    /// Maximizes a card to fill the canvas, or restores it to its pre-maximize
+    /// frame. Not real macOS fullscreen — the dock can't host anything once
+    /// CNVS itself goes fullscreen — just "this card fills the window."
+    func toggleFullscreen(_ id: UUID) {
+        guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
+        // The docked Simulator device window is a real OS window, kept Stay On
+        // Top of everything by design — SwiftUI z-index inside CNVS can never
+        // cover it, so a card going fullscreen has to actually hide it for
+        // real, not just draw over it.
+        let touchesSimulator = cards[idx].kind != .simulator
+
+        if cards[idx].isFullscreen {
+            if let f = cards[idx].preFullscreenFrame {
+                cards[idx].x = f.origin.x
+                cards[idx].y = f.origin.y
+                cards[idx].width = f.width
+                cards[idx].height = f.height
+            }
+            cards[idx].preFullscreenFrame = nil
+            cards[idx].isFullscreen = false
+            if touchesSimulator {
+                SimulatorDockController.shared.suppressed = false
+                if cards.contains(where: { $0.kind == .simulator }) {
+                    SimulatorDockController.shared.refresh()
+                }
+            }
+        } else {
+            cards[idx].preFullscreenFrame = CGRect(
+                x: cards[idx].x, y: cards[idx].y,
+                width: cards[idx].width, height: cards[idx].height
+            )
+            cards[idx].x = Self.margin
+            cards[idx].y = Self.margin
+            cards[idx].width = canvasSize.width - 2 * Self.margin
+            cards[idx].height = canvasSize.height - 2 * Self.margin - Self.commandBarClearance
+            cards[idx].isFullscreen = true
+            raise(id)
+            if touchesSimulator {
+                SimulatorDockController.shared.suppressed = true
+                if cards.contains(where: { $0.kind == .simulator }) {
+                    SimulatorDockController.shared.stow()
+                }
+            }
+        }
+    }
+
     func close(_ id: UUID) {
         if let card = cards.first(where: { $0.id == id }) {
             switch card.kind {
             case .terminal: TerminalRegistry.shared.remove(card.id)
-            case .simulator: SimulatorDockController.shared.minimize()
+            case .simulator: SimulatorDockController.shared.stow()
             case .player, .notes: break
+            }
+            // Closing a card mid-fullscreen must not leave the real Simulator
+            // window suppressed forever with nothing left to un-suppress it.
+            if card.isFullscreen, card.kind != .simulator {
+                SimulatorDockController.shared.suppressed = false
+                if cards.contains(where: { $0.kind == .simulator && $0.id != id }) {
+                    SimulatorDockController.shared.refresh()
+                }
             }
         }
         cards.removeAll { $0.id == id }
@@ -157,8 +216,22 @@ final class WorkspaceStore: ObservableObject {
             height: canvasSize.height - 2 * Self.margin - Self.commandBarClearance
         )
 
+        // The simulator card gets its own column sized to the real device
+        // window: Simulator refuses every programmatic resize, so a card cut
+        // to the panel column's share would just have a phone overhanging it.
+        if let sim = cards.firstIndex(where: { $0.kind == .simulator }), !cards[sim].isFullscreen,
+           let device = SimulatorDockController.shared.deviceSize {
+            let width = min(device.width, free.width)
+            let height = min(device.height + Self.simulatorHeader, free.height)
+            cards[sim].x = free.maxX - width
+            cards[sim].y = free.minY
+            cards[sim].width = width
+            cards[sim].height = height
+            free.size.width -= width + g
+        }
+
         let side = cards.indices
-            .filter { cards[$0].kind != .terminal }
+            .filter { cards[$0].kind != .terminal && cards[$0].kind != .simulator && !cards[$0].isFullscreen }
             .sorted { cards[$0].kind == .player && cards[$1].kind != .player }
         if !side.isEmpty {
             let panelW = min(460, free.width * 0.38)
@@ -176,7 +249,7 @@ final class WorkspaceStore: ObservableObject {
         }
 
         let terms = cards.indices
-            .filter { cards[$0].kind == .terminal }
+            .filter { cards[$0].kind == .terminal && !cards[$0].isFullscreen }
             .sorted { (cards[$0].y, cards[$0].x) < (cards[$1].y, cards[$1].x) }
         guard !terms.isEmpty else { return }
 

@@ -10,28 +10,55 @@ struct TodayUsage: Equatable {
     var byModel: [String: Int] = [:]
 }
 
-struct ClaudeLimitSnapshot: Equatable {
-    var fiveHourTokens = 0
-    var fiveHourPeakTokens = 0
-    var fiveHourPercent: Double?     // active 5h block's tokens vs your busiest past 5h block
-    var fiveHourResetMinutes: Int?
+/// One rolling quota window (Claude Code's own 5-hour session limit, or the
+/// 7-day weekly limit) — `usedPercent` and `resetsAt` are the real numbers
+/// Anthropic returns, not an estimate.
+struct RateLimitWindow: Equatable {
+    var usedPercent: Double
+    var resetsAt: Date
+    var length: TimeInterval   // 5h or 7d, needed to work out pace/projection
 
-    var weekTokens = 0
-    var weekPeakTokens = 0
-    var weekPercent: Double?         // this week's tokens vs your busiest past week
+    var elapsed: TimeInterval { max(0, min(length, length - resetsAt.timeIntervalSinceNow)) }
+    var elapsedFraction: Double { length > 0 ? elapsed / length : 0 }
+
+    /// used% minus "expected% if perfectly on pace for elapsed time".
+    /// Positive = burning faster than the window allows (deficit).
+    /// Negative = ahead of pace, banking headroom (reserve).
+    var paceDelta: Double { usedPercent - elapsedFraction * 100 }
+
+    /// Straight-line projection from window start through now — when you'd
+    /// hit 100% if usage kept accruing at the average rate seen so far.
+    var projectedEmpty: Date? {
+        guard usedPercent > 0, elapsed > 0 else { return nil }
+        let windowStart = resetsAt.addingTimeInterval(-length)
+        return windowStart.addingTimeInterval(elapsed * (100 / usedPercent))
+    }
+
+    /// Will you actually run dry before this window resets, at current pace?
+    var projectedToRunOut: Bool {
+        guard let projectedEmpty else { return false }
+        return projectedEmpty < resetsAt
+    }
+}
+
+struct ClaudeLimitSnapshot: Equatable {
+    // Real numbers, sourced from Claude Code's own statusline `rate_limits`
+    // feed (same data the CLI's `/usage` and status bar show) — see
+    // ~/.claude/statusline-command.sh, which drops each sample to
+    // ~/.claude/cache/cnvs-rate-limits.json for this card to read.
+    var session: RateLimitWindow?
+    var week: RateLimitWindow?
+    var sampledAt: Date?
+
+    // ccusage-derived auxiliary: only used for the rough "sessions left"
+    // estimate below, not for the headline percentages.
     var avgSessionTokens = 0
-    var estSessionsLeft: Int?        // rough "how many more typical sessions before matching your busiest week"
+    var weekTokens = 0
+    var estSessionsLeft: Int?
 
     var today = TodayUsage()
 }
 
-/// Anthropic doesn't expose actual plan-cap percentages anywhere (not via API,
-/// not locally) — so instead of faking a number against an unknown limit,
-/// this compares the live 5-hour/weekly window against Harrison's own busiest
-/// past window. Genuinely his "getting close to how hard I usually go," not a
-/// claim about the real account ceiling. Reads local session logs via
-/// `ccusage` (already the tool his stay-within-limits skill recommends), plus
-/// a direct scan of today's raw logs for the token/cost/message breakdown.
 @MainActor
 final class ClaudeUsageStore: ObservableObject {
     @Published var snapshot = ClaudeLimitSnapshot()
@@ -57,18 +84,47 @@ final class ClaudeUsageStore: ObservableObject {
         guard !loading else { return }
         loading = true
         Task.detached { [weak self] in
-            var mutableSnap = Self.computeLimits()
+            var mutableSnap = Self.readRateLimits()
+            Self.attachSessionsLeftEstimate(&mutableSnap)
             mutableSnap.today = Self.scanToday()
             let snap = mutableSnap
             await MainActor.run { [weak self] in
                 self?.snapshot = snap
-                self?.unavailable = snap.fiveHourPercent == nil && snap.weekPercent == nil
+                self?.unavailable = snap.session == nil && snap.week == nil
                 self?.loading = false
             }
         }
     }
 
-    // MARK: - ccusage-derived: 5h / weekly vs personal peak
+    // MARK: - Real quota: Claude Code's own rate_limits feed
+
+    nonisolated private static func readRateLimits() -> ClaudeLimitSnapshot {
+        var snap = ClaudeLimitSnapshot()
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/cache/cnvs-rate-limits.json")
+        guard let data = try? Data(contentsOf: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return snap }
+
+        if let sampledAt = obj["sampled_at"] as? Double {
+            snap.sampledAt = Date(timeIntervalSince1970: sampledAt)
+        }
+        guard let rateLimits = obj["rate_limits"] as? [String: Any] else { return snap }
+
+        if let fiveHour = rateLimits["five_hour"] as? [String: Any],
+           let pct = fiveHour["used_percentage"] as? Double,
+           let resets = fiveHour["resets_at"] as? Double {
+            snap.session = RateLimitWindow(usedPercent: pct, resetsAt: Date(timeIntervalSince1970: resets), length: sessionWindowLength)
+        }
+        if let sevenDay = rateLimits["seven_day"] as? [String: Any],
+           let pct = sevenDay["used_percentage"] as? Double,
+           let resets = sevenDay["resets_at"] as? Double {
+            snap.week = RateLimitWindow(usedPercent: pct, resetsAt: Date(timeIntervalSince1970: resets), length: weekWindowLength)
+        }
+        return snap
+    }
+
+    // MARK: - ccusage-derived: rough "sessions left" estimate only
 
     nonisolated private static func run(_ command: String) -> Data? {
         let proc = Process()
@@ -87,8 +143,12 @@ final class ClaudeUsageStore: ObservableObject {
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
-    nonisolated private static func computeLimits() -> ClaudeLimitSnapshot {
-        var snap = ClaudeLimitSnapshot()
+    /// Converts the real weekly used% into a token-equivalent using ccusage's
+    /// weekly token total, then divides remaining headroom by the average
+    /// size of a past 5h block. Still an estimate — just anchored to the
+    /// real weekly percentage instead of a personal-peak comparison.
+    nonisolated private static func attachSessionsLeftEstimate(_ snap: inout ClaudeLimitSnapshot) {
+        guard let week = snap.week, week.usedPercent > 0 else { return }
 
         var pastBlockTokens: [Int] = []
         if let all = json("ccusage claude blocks --json"),
@@ -97,38 +157,19 @@ final class ClaudeUsageStore: ObservableObject {
                 .filter { ($0["isGap"] as? Bool) != true && ($0["isActive"] as? Bool) != true }
                 .compactMap { $0["totalTokens"] as? Int }
         }
-        if !pastBlockTokens.isEmpty {
-            snap.avgSessionTokens = pastBlockTokens.reduce(0, +) / pastBlockTokens.count
-        }
+        guard !pastBlockTokens.isEmpty else { return }
+        snap.avgSessionTokens = pastBlockTokens.reduce(0, +) / pastBlockTokens.count
 
-        if let active = json("ccusage claude blocks --active --json"),
-           let blocks = active["blocks"] as? [[String: Any]],
-           let current = blocks.first(where: { ($0["isActive"] as? Bool) == true }),
-           let currentTokens = current["totalTokens"] as? Int {
-            snap.fiveHourTokens = currentTokens
-            snap.fiveHourResetMinutes = (current["projection"] as? [String: Any])?["remainingMinutes"] as? Int
-            if let peak = pastBlockTokens.max(), peak > 0 {
-                snap.fiveHourPeakTokens = peak
-                snap.fiveHourPercent = min(999, Double(currentTokens) / Double(peak) * 100)
-            }
-        }
+        guard let weekly = json("ccusage claude weekly --json"),
+              let weeks = weekly["weekly"] as? [[String: Any]],
+              let currentTokens = weeks.last?["totalTokens"] as? Int, currentTokens > 0
+        else { return }
+        snap.weekTokens = currentTokens
 
-        if let weekly = json("ccusage claude weekly --json"),
-           let weeks = weekly["weekly"] as? [[String: Any]], weeks.count >= 2 {
-            let currentTokens = weeks.last?["totalTokens"] as? Int ?? 0
-            let priorPeak = weeks.dropLast().compactMap { $0["totalTokens"] as? Int }.max()
-            snap.weekTokens = currentTokens
-            if let priorPeak, priorPeak > 0 {
-                snap.weekPeakTokens = priorPeak
-                snap.weekPercent = min(999, Double(currentTokens) / Double(priorPeak) * 100)
-                if snap.avgSessionTokens > 0 {
-                    let headroom = max(0, priorPeak - currentTokens)
-                    snap.estSessionsLeft = headroom / snap.avgSessionTokens
-                }
-            }
-        }
-
-        return snap
+        guard snap.avgSessionTokens > 0 else { return }
+        let tokensPerPercent = Double(currentTokens) / week.usedPercent
+        let remainingTokenEquivalent = (100 - week.usedPercent) * tokensPerPercent
+        snap.estSessionsLeft = max(0, Int(remainingTokenEquivalent / Double(snap.avgSessionTokens)))
     }
 
     // MARK: - Raw local scan: today's tokens/cost/messages
@@ -207,6 +248,9 @@ final class ClaudeUsageStore: ObservableObject {
 
 /// Short-and-sweet pill, same chrome as the command bar — not a resizable
 /// card. Docks bottom-right of the window; tap for the full breakdown.
+private let sessionWindowLength: TimeInterval = 5 * 3600
+private let weekWindowLength: TimeInterval = 7 * 24 * 3600
+
 struct ClaudeUsageBar: View {
     @StateObject private var store = ClaudeUsageStore()
     @State private var showDetail = false
@@ -218,18 +262,18 @@ struct ClaudeUsageBar: View {
                 .foregroundStyle(Theme.headerText)
 
             if store.unavailable {
-                Text("ccusage unavailable")
+                Text("no usage data yet")
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.headerText)
             } else {
-                gauge(label: "5h", percent: store.snapshot.fiveHourPercent)
-                if let mins = store.snapshot.fiveHourResetMinutes {
-                    Text("\(mins)m")
+                gauge(label: "5h", percent: store.snapshot.session?.usedPercent)
+                if let session = store.snapshot.session {
+                    Text(formatDuration(session.resetsAt.timeIntervalSinceNow))
                         .font(Theme.mono(9))
                         .foregroundStyle(Theme.headerText.opacity(0.7))
                 }
                 Rectangle().fill(Color.white.opacity(0.1)).frame(width: 1, height: 14)
-                gauge(label: "week", percent: store.snapshot.weekPercent)
+                gauge(label: "week", percent: store.snapshot.week?.usedPercent)
             }
             if store.loading { ProgressView().controlSize(.mini) }
         }
@@ -270,6 +314,13 @@ struct ClaudeUsageBar: View {
     }
 }
 
+private func formatDuration(_ interval: TimeInterval) -> String {
+    let total = max(0, Int(interval))
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    return h > 0 ? "\(h)h\(String(format: "%02d", m))m" : "\(m)m"
+}
+
 struct ClaudeUsageDetailView: View {
     @ObservedObject var store: ClaudeUsageStore
 
@@ -279,23 +330,23 @@ struct ClaudeUsageDetailView: View {
                 .font(Theme.mono(12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
 
-            section("this 5-hour window") {
-                row("used", "\(formatTok(store.snapshot.fiveHourTokens)) tok")
-                row("vs your busiest 5h ever", store.snapshot.fiveHourPeakTokens > 0
-                    ? "\(formatTok(store.snapshot.fiveHourPeakTokens)) tok (\(pct(store.snapshot.fiveHourPercent)))"
-                    : "no history yet")
-                if let mins = store.snapshot.fiveHourResetMinutes {
-                    row("resets in", "\(mins)m")
+            section("session · resets in \(store.snapshot.session.map { formatDuration($0.resetsAt.timeIntervalSinceNow) } ?? "—")") {
+                if let session = store.snapshot.session {
+                    windowBody(session)
+                } else {
+                    row("used", "no data yet")
                 }
             }
 
-            section("this week") {
-                row("used", "\(formatTok(store.snapshot.weekTokens)) tok")
-                row("vs your busiest week ever", store.snapshot.weekPeakTokens > 0
-                    ? "\(formatTok(store.snapshot.weekPeakTokens)) tok (\(pct(store.snapshot.weekPercent)))"
-                    : "no history yet")
-                if let left = store.snapshot.estSessionsLeft {
-                    row("≈ sessions left before that", "\(left)")
+            section("weekly · resets in \(store.snapshot.week.map { formatDuration($0.resetsAt.timeIntervalSinceNow) } ?? "—")") {
+                if let week = store.snapshot.week {
+                    windowBody(week)
+                    row("windows until reset", "\(max(0, Int(week.resetsAt.timeIntervalSinceNow / (5 * 3600))))")
+                    if let left = store.snapshot.estSessionsLeft {
+                        row("≈ session quotas left", "\(left)")
+                    }
+                } else {
+                    row("used", "no data yet")
                 }
             }
 
@@ -314,7 +365,9 @@ struct ClaudeUsageDetailView: View {
                 }
             }
 
-            Text("5h/week are Harrison's own historical peaks, not Anthropic's real plan cap — that number isn't exposed anywhere. Cost is a list-price estimate, not a bill.")
+            Text(store.unavailable
+                 ? "No rate-limit sample yet — send a prompt in any Claude Code session to populate this."
+                 : "5h/weekly are Anthropic's real numbers, read from Claude Code's own statusline feed — only updates while a session is actively running. Sessions-left and cost are rough local estimates.")
                 .font(Theme.mono(8))
                 .foregroundStyle(Theme.headerText.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
@@ -323,8 +376,67 @@ struct ClaudeUsageDetailView: View {
         .frame(width: 300)
     }
 
+    /// Shared body for a single quota window: big used%, bar with an on-pace
+    /// tick, and the deficit/reserve pacing arrow — used for counts, not for
+    /// left, so it climbs toward 100 rather than the plan draining down.
+    @ViewBuilder
+    private func windowBody(_ window: RateLimitWindow) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("\(String(format: "%.0f", window.usedPercent))% used")
+                .font(Theme.mono(14, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+            Spacer()
+            pacePill(window.paceDelta)
+        }
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.08)).frame(height: 6)
+                Capsule().fill(gaugeColor(window.usedPercent))
+                    .frame(width: geo.size.width * min(1, window.usedPercent / 100), height: 6)
+                // on-pace tick: where you'd be if usage tracked elapsed time exactly
+                Rectangle().fill(Color.white.opacity(0.55))
+                    .frame(width: 1.5, height: 10)
+                    .offset(x: geo.size.width * min(1, window.elapsedFraction) - 0.75, y: -2)
+            }
+        }
+        .frame(height: 10)
+
+        if window.projectedToRunOut, let empty = window.projectedEmpty {
+            row("projected empty in", formatDuration(empty.timeIntervalSinceNow))
+        } else {
+            row("projected empty", "lasts until reset")
+        }
+    }
+
+    @ViewBuilder
+    private func pacePill(_ delta: Double) -> some View {
+        let rounded = abs(delta).rounded()
+        if rounded < 1 {
+            Label("on target", systemImage: "arrow.right")
+                .labelStyle(.titleAndIcon)
+                .font(Theme.mono(9, weight: .medium))
+                .foregroundStyle(Theme.headerText.opacity(0.8))
+        } else if delta > 0 {
+            Label("\(Int(rounded))% in deficit", systemImage: "arrow.up.right")
+                .labelStyle(.titleAndIcon)
+                .font(Theme.mono(9, weight: .medium))
+                .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.35))
+        } else {
+            Label("\(Int(rounded))% in reserve", systemImage: "arrow.down.right")
+                .labelStyle(.titleAndIcon)
+                .font(Theme.mono(9, weight: .medium))
+                .foregroundStyle(Color(red: 0.45, green: 0.85, blue: 0.55))
+        }
+    }
+
+    private func gaugeColor(_ p: Double) -> Color {
+        if p >= 90 { return Color(red: 0.95, green: 0.35, blue: 0.35) }
+        if p >= 70 { return .orange }
+        return Color(red: 0.45, green: 0.85, blue: 0.55)
+    }
+
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(Theme.mono(10, weight: .semibold))
                 .foregroundStyle(Theme.accent.opacity(0.85))
@@ -339,8 +451,6 @@ struct ClaudeUsageDetailView: View {
             Text(value).font(Theme.mono(10, weight: .medium)).foregroundStyle(.white.opacity(0.88))
         }
     }
-
-    private func pct(_ p: Double?) -> String { p.map { String(format: "%.0f%%", $0) } ?? "—" }
 
     private func formatTok(_ n: Int) -> String {
         if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }

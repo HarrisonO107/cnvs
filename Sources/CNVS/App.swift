@@ -73,6 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Card close undoes Stay On Top, but quitting with the card still open
+    /// would leave the phone floating over every other app forever.
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { SimulatorDockController.shared.releaseStayOnTop() }
+    }
 }
 
 /// Terminal requests from the phone, two transports:
@@ -153,4 +159,6 @@ extension Notification.Name {
     static let cnvsVoiceToggle = Notification.Name("cnvsVoiceToggle")
     static let cnvsWakeToggle = Notification.Name("cnvsWakeToggle")
     static let cnvsSimulatorToggle = Notification.Name("cnvsSimulatorToggle")
+    /// Device window found or resized — the layout needs to re-fit its card.
+    static let cnvsSimulatorSized = Notification.Name("cnvsSimulatorSized")
 }

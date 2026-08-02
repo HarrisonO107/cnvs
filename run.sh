@@ -10,7 +10,10 @@ SCRATCH="$HOME/work/build/cnvs-build"
 mkdir -p "$SCRATCH"
 swift build -c release --scratch-path "$SCRATCH"
 
-APP=build/CNVS.app
+# The .app must live OUTSIDE iCloud too: on the synced Desktop, iCloud spawns
+# conflict duplicates ("CNVS 2.app") that hijack LaunchServices registration
+# and TCC grants (Accessibility entry silently rebinds to the duplicate).
+APP="$SCRATCH/CNVS.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
