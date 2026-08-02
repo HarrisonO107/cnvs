@@ -25,6 +25,14 @@ struct CNVSApp: App {
                     NotificationCenter.default.post(name: .cnvsTidy, object: nil)
                 }
                 .keyboardShortcut("g", modifiers: [.command])
+                Button("Notes") {
+                    NotificationCenter.default.post(name: .cnvsNotesToggle, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Music") {
+                    NotificationCenter.default.post(name: .cnvsMusicToggle, object: nil)
+                }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("Voice") {
                     NotificationCenter.default.post(name: .cnvsVoiceToggle, object: nil)
                 }
@@ -155,6 +163,8 @@ extension Notification.Name {
     static let cnvsNewTerminal = Notification.Name("cnvsNewTerminal")
     static let cnvsFocusCommandBar = Notification.Name("cnvsFocusCommandBar")
     static let cnvsTidy = Notification.Name("cnvsTidy")
+    static let cnvsNotesToggle = Notification.Name("cnvsNotesToggle")
+    static let cnvsMusicToggle = Notification.Name("cnvsMusicToggle")
     static let cnvsOpenPhoneTerminal = Notification.Name("cnvsOpenPhoneTerminal")
     static let cnvsVoiceToggle = Notification.Name("cnvsVoiceToggle")
     static let cnvsWakeToggle = Notification.Name("cnvsWakeToggle")

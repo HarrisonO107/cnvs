@@ -58,6 +58,12 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .cnvsTidy)) { _ in
             tidy()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsNotesToggle)) { _ in
+            withAnimation(Self.tidySpring) { store.togglePanel(.notes) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cnvsMusicToggle)) { _ in
+            withAnimation(Self.tidySpring) { store.togglePanel(.player) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .cnvsOpenPhoneTerminal)) { _ in
             openPhoneTerminals()
         }
