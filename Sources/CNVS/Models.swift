@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum CardKind: String, Codable {
-    case terminal, player, notes, simulator, github, claudeUsage
+    case terminal, player, notes, simulator
 }
 
 struct Card: Identifiable, Codable {
@@ -66,28 +66,6 @@ final class WorkspaceStore: ObservableObject {
         } else {
             cards = Self.defaultLayout()
         }
-        seedUtilityCardsIfNeeded()
-    }
-
-    /// github + claude-usage ship after cards were already saved for existing
-    /// installs — add each once, flagged so a deliberate close later sticks.
-    private func seedUtilityCardsIfNeeded() {
-        let defaults = UserDefaults.standard
-        var added = false
-        for kind in [CardKind.github, .claudeUsage] {
-            let flag = "cnvs.seeded.\(kind.rawValue)"
-            guard !defaults.bool(forKey: flag) else { continue }
-            defaults.set(true, forKey: flag)
-            guard !cards.contains(where: { $0.kind == kind }) else { continue }
-            let (title, size) = defaultsForToggle(kind)
-            let top = (cards.map(\.z).max() ?? 0) + 1
-            cards.append(Card(
-                id: UUID(), kind: kind, title: title,
-                x: Self.margin, y: Self.margin, width: size.width, height: size.height, z: top
-            ))
-            added = true
-        }
-        if added { tidy() }
     }
 
     static let radioTitle = "claude radio"
@@ -118,7 +96,7 @@ final class WorkspaceStore: ObservableObject {
             switch card.kind {
             case .terminal: TerminalRegistry.shared.remove(card.id)
             case .simulator: SimulatorDockController.shared.minimize()
-            case .player, .notes, .github, .claudeUsage: break
+            case .player, .notes: break
             }
         }
         cards.removeAll { $0.id == id }
@@ -161,8 +139,6 @@ final class WorkspaceStore: ObservableObject {
         case .notes: return ("notes", CGSize(width: 460, height: 300))
         case .simulator: return ("simulator", CGSize(width: 420, height: 720)) // phone-shaped, not squashed to the panel split
         case .terminal: return ("terminal", CGSize(width: 680, height: 480))
-        case .github: return ("github", CGSize(width: 340, height: 230))
-        case .claudeUsage: return ("claude usage", CGSize(width: 340, height: 230))
         }
     }
 
@@ -182,7 +158,7 @@ final class WorkspaceStore: ObservableObject {
         )
 
         let side = cards.indices
-            .filter { [.player, .notes, .simulator].contains(cards[$0].kind) }
+            .filter { cards[$0].kind != .terminal }
             .sorted { cards[$0].kind == .player && cards[$1].kind != .player }
         if !side.isEmpty {
             let panelW = min(460, free.width * 0.38)
@@ -197,22 +173,6 @@ final class WorkspaceStore: ObservableObject {
                 y += panelH + g
             }
             free.size.width -= panelW + g
-        }
-
-        // Utility widgets dock the two bottom corners of whatever's left —
-        // github bottom-left, claude usage bottom-right — small enough that
-        // terminals still read as the main surface above them.
-        let utility = cards.indices.filter { [.github, .claudeUsage].contains(cards[$0].kind) }
-        if !utility.isEmpty {
-            let stripH = min(230, free.height * 0.35)
-            let panelW = min(340, (free.width - g) / 2)
-            for i in utility {
-                cards[i].width = panelW
-                cards[i].height = stripH
-                cards[i].y = free.maxY - stripH
-                cards[i].x = cards[i].kind == .github ? free.minX : free.maxX - panelW
-            }
-            free.size.height -= stripH + g
         }
 
         let terms = cards.indices

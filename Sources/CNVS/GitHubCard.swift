@@ -17,7 +17,7 @@ enum GitAdvice {
 
 /// Watches whichever hfjoandco project looks most recently touched and turns
 /// `git status` into plain language — Harrison doesn't read git natively, so
-/// this card is the translation layer: is now a good time to commit or not.
+/// this bar is the translation layer: is now a good time to commit or not.
 @MainActor
 final class GitHelperStore: ObservableObject {
     @Published var status: GitStatusSnapshot?
@@ -64,21 +64,42 @@ final class GitHelperStore: ObservableObject {
         Task.detached { [weak self] in
             _ = Self.run(dir, ["add", "-A"])
             let diffStat = Self.run(dir, ["diff", "--cached", "--stat"])
-            let prompt = "Write ONE git commit subject line, conventional-commits style, max 60 chars, " +
-                "no body, no quotes, for this staged diffstat:\n\(diffStat)"
+            guard !diffStat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                await MainActor.run { [weak self] in
+                    self?.committing = false
+                    self?.message = "nothing staged"
+                }
+                return
+            }
 
+            let prompt = "Write ONE git commit subject line, conventional-commits style, max 60 chars, " +
+                "no body, no quotes, no explanation — ONLY the subject line — for this staged diffstat:\n\(diffStat)"
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
             proc.arguments = ["-lc", "claude -p \(prompt.shellQuoted) --model haiku 2>/dev/null | tail -1"]
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = Pipe()
-            var subject = "checkpoint"
+
+            // Never fall back to a placeholder subject — a bad/empty
+            // generation means we bail without committing, not commit blind
+            // under a meaningless message.
+            var subject: String?
             if (try? proc.run()) != nil {
                 proc.waitUntilExit()
-                let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !out.isEmpty { subject = out }
+                if proc.terminationStatus == 0 {
+                    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !out.isEmpty, out.count <= 100, !out.contains("\n") { subject = out }
+                }
+            }
+
+            guard let subject else {
+                await MainActor.run { [weak self] in
+                    self?.committing = false
+                    self?.message = "couldn't write a message — try again"
+                }
+                return
             }
 
             let commitOut = Self.run(dir, ["commit", "-m", subject])
@@ -157,11 +178,82 @@ final class GitHelperStore: ObservableObject {
     }
 }
 
-struct GitHubHelperView: View {
+/// Short-and-sweet pill, same chrome as the command bar — not a resizable
+/// card. Docks bottom-left of the window; tap for the full breakdown.
+struct GitHubStatusBar: View {
     @StateObject private var store = GitHelperStore()
+    @State private var showDetail = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.headerText)
+
+            if let status = store.status {
+                Circle().fill(adviceColor).frame(width: 6, height: 6)
+                Text(status.repoName)
+                    .font(Theme.mono(11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.88))
+                Text(shortAdvice(status))
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.headerText)
+                    .lineLimit(1)
+
+                if status.totalChanged > 0 && !status.hasConflicts {
+                    Button(action: store.commit) {
+                        Text(store.committing ? "…" : "commit")
+                    }
+                    .buttonStyle(.plain)
+                    .font(Theme.mono(10, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .disabled(store.committing)
+                }
+            } else {
+                Text("no git project found")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.headerText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .cardSurface()
+        .contentShape(Rectangle())
+        .onTapGesture { showDetail.toggle() }
+        .popover(isPresented: $showDetail, arrowEdge: .bottom) {
+            GitHubDetailView(store: store)
+        }
+        .onAppear { store.start() }
+        .onDisappear { store.stop() }
+    }
+
+    private var adviceColor: Color {
+        switch store.advice {
+        case .none, .clean: return Color(red: 0.55, green: 0.65, blue: 0.95)
+        case .aheadOnly: return Theme.accent
+        case .readyToCommit: return Color(red: 0.45, green: 0.85, blue: 0.55)
+        case .bigChange: return .orange
+        case .conflict: return Color(red: 0.95, green: 0.35, blue: 0.35)
+        }
+    }
+
+    private func shortAdvice(_ s: GitStatusSnapshot) -> String {
+        switch store.advice {
+        case .none: return ""
+        case .clean: return "clean"
+        case .aheadOnly: return "push \(s.ahead)"
+        case .readyToCommit: return "\(s.totalChanged) file\(s.totalChanged == 1 ? "" : "s") — commit"
+        case .bigChange: return "\(s.totalChanged) files — big"
+        case .conflict: return "conflict!"
+        }
+    }
+}
+
+struct GitHubDetailView: View {
+    @ObservedObject var store: GitHelperStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
             if let status = store.status {
                 HStack(spacing: 6) {
                     Circle().fill(adviceColor).frame(width: 8, height: 8)
@@ -187,22 +279,16 @@ struct GitHubHelperView: View {
                 if !status.changedFiles.isEmpty {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
-                            ForEach(status.changedFiles.prefix(5), id: \.self) { f in
+                            ForEach(status.changedFiles, id: \.self) { f in
                                 Text("· \(f)")
                                     .font(Theme.mono(9))
                                     .foregroundStyle(Theme.headerText)
                                     .lineLimit(1)
                             }
-                            if status.changedFiles.count > 5 {
-                                Text("+ \(status.changedFiles.count - 5) more")
-                                    .font(Theme.mono(9))
-                                    .foregroundStyle(Theme.headerText)
-                            }
                         }
                     }
+                    .frame(maxHeight: 140)
                 }
-
-                Spacer(minLength: 0)
 
                 HStack {
                     if let msg = store.message {
@@ -225,18 +311,18 @@ struct GitHubHelperView: View {
                         .disabled(store.committing)
                     }
                 }
+
+                Text("watches whichever hfjoandco project you touched last (by .git/HEAD mtime).")
+                    .font(Theme.mono(8))
+                    .foregroundStyle(Theme.headerText.opacity(0.7))
             } else {
-                Spacer()
                 Text("no git project found under hfjoandco")
                     .font(Theme.mono(11))
                     .foregroundStyle(Theme.headerText)
-                Spacer()
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onAppear { store.start() }
-        .onDisappear { store.stop() }
+        .padding(14)
+        .frame(width: 300)
     }
 
     private var adviceColor: Color {

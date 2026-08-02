@@ -68,7 +68,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force -s - "$APP" 2>/dev/null || true
+# A stable, TRUSTED identity, not ad-hoc (-). Ad-hoc gets a fresh signature
+# every rebuild, which invalidates TCC grants (Accessibility etc.) each
+# build. A self-signed cert ("CNVS Dev") isn't enough either: its chain is
+# untrusted, so tccd's re-validation fails and grants flap on/off. The
+# Apple Development cert from Xcode has a trusted chain and survives
+# rebuilds — grants stick until the cert's yearly renewal.
+APPLE_DEV_ID="585FDA2852D267963ADCAFA70A7A441896FE9836" # Apple Development: Harrison Oarton (Q953L6W3ZZ)
+codesign --force -s "$APPLE_DEV_ID" "$APP" 2>/dev/null || codesign --force -s - "$APP" 2>/dev/null || true
 
 # Register the cnvs:// URL scheme with LaunchServices (the build listener opens
 # phone terminals with `open cnvs://terminal?session=...`).

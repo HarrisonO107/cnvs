@@ -11,6 +11,7 @@ import SwiftUI
 final class SimulatorDockController: ObservableObject {
     enum Status: Equatable {
         case locating
+        case needsPermission
         case notRunning
         case noWindow
         case docked
@@ -24,11 +25,15 @@ final class SimulatorDockController: ObservableObject {
     private var pollTimer: Timer?
     private let bundleID = "com.apple.iphonesimulator"
 
-    /// Prompts once if CNVS isn't yet trusted for Accessibility — required to
-    /// move another app's window. No-op once granted.
-    func ensurePermission() {
-        let opts: NSDictionary = [kAXTrustedCheckOptionPrompt: true]
-        _ = AXIsProcessTrustedWithOptions(opts as CFDictionary)
+    /// `AXIsProcessTrustedWithOptions` (the *prompting* variant) segfaults
+    /// inside CFGetTypeID for this ad-hoc-signed, unnotarized build —
+    /// reproduced 3x, independent of the dictionary's value type. Stick to
+    /// the plain, argument-free trust check and send the user to System
+    /// Settings ourselves instead of letting AX drive the prompt.
+    func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func launchIfNeeded() {
@@ -50,8 +55,17 @@ final class SimulatorDockController: ObservableObject {
     }
 
     /// Looks for the device window. Call after launch and whenever nothing's
-    /// found yet — the window mounts a beat after the process does.
+    /// found yet — the window mounts a beat after the process does. Also the
+    /// only place that re-checks Accessibility trust, so the polling loop
+    /// naturally picks up a grant made in System Settings without CNVS
+    /// needing a live notification for it.
     func refresh() {
+        guard AXIsProcessTrusted() else {
+            status = .needsPermission
+            axWindow = nil
+            startPolling()
+            return
+        }
         guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID })
         else {
             status = .notRunning
@@ -136,6 +150,9 @@ struct SimulatorDockView: View {
     var body: some View {
         ZStack {
             switch dock.status {
+            case .needsPermission:
+                placeholder("needs accessibility access to dock the window", symbol: "lock.shield",
+                            actionLabel: "open settings", action: dock.openAccessibilitySettings)
             case .notRunning:
                 placeholder("simulator not running", symbol: "iphone.slash",
                             actionLabel: "open simulator", action: dock.launchIfNeeded)
@@ -154,7 +171,6 @@ struct SimulatorDockView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMoveNotification)) { _ in resync() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { _ in resync() }
         .task {
-            dock.ensurePermission()
             dock.refresh()
         }
     }

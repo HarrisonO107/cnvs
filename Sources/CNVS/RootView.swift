@@ -25,10 +25,17 @@ struct RootView: View {
             }
             .padding(.top, 28) // clear the traffic lights
 
-            VStack(spacing: 8) {
-                if voice.phase != .idle { voiceHUD }
-                commandBar
+            HStack(alignment: .bottom, spacing: 12) {
+                GitHubStatusBar()
+                Spacer(minLength: 12)
+                VStack(spacing: 8) {
+                    if voice.phase != .idle { voiceHUD }
+                    commandBar
+                }
+                Spacer(minLength: 12)
+                ClaudeUsageBar()
             }
+            .padding(.horizontal, 16)
             .padding(.bottom, 14)
         }
         .animation(Self.tidySpring, value: voice.phase)
@@ -148,12 +155,6 @@ struct RootView: View {
             }
             barButton("iphone", help: "toggle simulator (⌘I)") {
                 withAnimation(Self.tidySpring) { store.togglePanel(.simulator) }
-            }
-            barButton("arrow.triangle.branch", help: "toggle github helper") {
-                withAnimation(Self.tidySpring) { store.togglePanel(.github) }
-            }
-            barButton("chart.bar.fill", help: "toggle claude usage") {
-                withAnimation(Self.tidySpring) { store.togglePanel(.claudeUsage) }
             }
             barButton("square.grid.3x3", help: "tidy — snap to grid (⌘G)") { tidy() }
             barButton(voice.phase == .listening ? "mic.fill" : "mic",
@@ -545,10 +546,6 @@ struct CardView: View {
                         bottomTrailingRadius: Theme.cardRadius
                     )
                 )
-        case .github:
-            GitHubHelperView()
-        case .claudeUsage:
-            ClaudeUsageView()
         }
     }
 
@@ -558,8 +555,6 @@ struct CardView: View {
         case .player: return Theme.accent
         case .notes: return Color(red: 0.55, green: 0.65, blue: 0.95)
         case .simulator: return Color(red: 0.95, green: 0.55, blue: 0.35)
-        case .github: return Color(red: 0.75, green: 0.75, blue: 0.78)
-        case .claudeUsage: return Color(red: 0.90, green: 0.50, blue: 0.35)
         }
     }
 }
