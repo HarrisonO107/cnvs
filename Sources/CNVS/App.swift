@@ -12,6 +12,22 @@ struct CNVSApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1380, height: 840)
         .commands {
+            // Route clipboard commands through AppKit's responder chain so
+            // embedded SwiftTerm views receive them as well as text editors.
+            CommandGroup(replacing: .pasteboard) {
+                Button("Cut") {
+                    NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut("x", modifiers: .command)
+                Button("Copy") {
+                    NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut("c", modifiers: .command)
+                Button("Paste") {
+                    NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut("v", modifiers: .command)
+            }
             CommandGroup(after: .newItem) {
                 Button("New Terminal") {
                     NotificationCenter.default.post(name: .cnvsNewTerminal, object: nil)
