@@ -15,7 +15,7 @@ final class TerminalRegistry {
     func view(for id: UUID, session: String?, bootCommand: String?) -> LocalProcessTerminalView {
         if let existing = views[id] { return existing }
 
-        let tv = LocalProcessTerminalView(frame: .init(x: 0, y: 0, width: 600, height: 400))
+        let tv = CNVSTerminalView(frame: .init(x: 0, y: 0, width: 600, height: 400))
         tv.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
         // Alpha 0 keeps every SwiftTerm background fill a no-op (true glass),
         // while the RGB components give shells querying the terminal colour

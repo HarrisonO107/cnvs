@@ -28,6 +28,12 @@ struct CNVSApp: App {
                 }
                 .keyboardShortcut("v", modifiers: .command)
             }
+            CommandGroup(after: .pasteboard) {
+                Button("Delete Previous Word") {
+                    NSApp.sendAction(#selector(NSResponder.deleteWordBackward(_:)), to: nil, from: nil)
+                }
+                .keyboardShortcut(.delete, modifiers: .control)
+            }
             CommandGroup(after: .newItem) {
                 Button("New Terminal") {
                     NotificationCenter.default.post(name: .cnvsNewTerminal, object: nil)
